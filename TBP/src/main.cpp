@@ -26,7 +26,6 @@ void setup() {
   digitalWrite(pumpPin1, LOW)
   digitalWrite(pumpPin2, High)
   Pump spins opposite direction
-  Tes test test test
 */
 
 /*
