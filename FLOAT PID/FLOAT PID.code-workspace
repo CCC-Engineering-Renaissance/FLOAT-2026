@@ -2,6 +2,9 @@
 	"folders": [
 		{
 			"path": "."
+		},
+		{
+			"path": "../FLOAT Time Based Pump"
 		}
 	],
 	"settings": {}
