@@ -31,7 +31,6 @@ void setup() {
   sensor.init();             // Initialize the sensor
   sensor.setModel(MS5837::MS5837_30BA); //Sets the model of pressure sensor used
   sensor.setFluidDensity(1021.925); //Sets fluid density of EGADS
-  //This is me making a change right now
   
 }
 
