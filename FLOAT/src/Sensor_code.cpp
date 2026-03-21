@@ -3,13 +3,13 @@
 #include <ArduinoJson.h>
 #include <Wire.h>
 #include "MS5837.h"
-#include <PID.cpp>
+#include "PID.cpp"
 
 #define LED 2
 #define pumpPin1 1 //Pin 1 for Pump Connection
 #define pumpPin2 2 //Pin 2 for Pump Connection
 #define speedPin 3 //Pin for speed control
-MS5837 sensor;
+
 
 // defines pins
 // HC12
@@ -32,15 +32,6 @@ unsigned long sendInterval = 5000; // Send data every 5 seconds
 
 unsigned long holdTime = 30000;
 unsigned long holdStart = 0;
-// PID variables
-double kp {1};
-double ki {1};
-double kd {1};
-
-double integral {};
-double previousError {};
-double dt {};
-double lastTime {0};
 
 enum State {
   WAIT,
@@ -60,8 +51,14 @@ struct SensorData {
   float depth;
 };
 
+// Function declarations
+void sendData(float pressure, float depth, float time);
+void PumpIn(int speed);
+void PumpOut(int speed);
+void PumpStop();
+double PID(double error);
 
-void setup() {
+void setupSensor() {
   // HC12
   Serial.begin(115200);    // beginning baud rate
   Serial1.begin(BAUDRATE);  // HC-12 module UART initialization
@@ -70,6 +67,10 @@ void setup() {
   pinMode(stepPin, OUTPUT);
   pinMode(dirPin, OUTPUT);
   pinMode(enPin, OUTPUT);
+
+  pinMode(pumpPin1, OUTPUT);
+  pinMode(pumpPin2, OUTPUT);
+  pinMode(speedPin, OUTPUT);
 
 
   digitalWrite(enPin, HIGH);
@@ -89,7 +90,7 @@ void setup() {
   Serial.println("waiting for START Command");
 }
 
-void loop() {
+void loopSensor() {
   //reading sensor 
   sensor.read();
   float depth = sensor.depth();

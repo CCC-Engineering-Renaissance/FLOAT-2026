@@ -16,7 +16,7 @@ double kd {1};
 double integral {};
 double previousError {};
 double targetDepth {2.5};
-double error {};
+
 double flowRate {}; //What the PID is changing
 double dt {};
 double lastTime {0}; //Initialize lastTime. Starts at 0 seconds.
