@@ -2,6 +2,7 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <Wire.h>
+#include <string>
 #include "MS5837.h"
 #include "PID.cpp"
 
@@ -32,6 +33,10 @@ unsigned long sendInterval = 5000; // Send data every 5 seconds
 
 unsigned long holdTime = 30000;
 unsigned long holdStart = 0;
+
+string transmitData;
+
+string dataStore;
 
 enum State {
   WAIT,
@@ -208,7 +213,9 @@ switch (currentState) {
         }
         }
         if (millis() - lastSendTime >= sendInterval && packetcount < 7) { // Send data every 5 seconds
-          sendData(pressure, depth, timeNow);
+          String trans = String(depth) + " " + String(pressure) + " " + String(time) + "\n";
+	  transmitData = transmitData + trans;
+	  //sendData(pressure, depth, timeNow);
           lastSendTime = millis();
           packetcount++;
         }
@@ -216,6 +223,9 @@ switch (currentState) {
       case DONE:
           Serial.println("Completed");
           PumpStop();
+	  while (true) {
+	    
+	  }
   break;
     }
   }
