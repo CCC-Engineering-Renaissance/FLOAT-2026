@@ -215,7 +215,6 @@ switch (currentState) {
         if (millis() - lastSendTime >= sendInterval && packetcount < 7) { // Send data every 5 seconds
           String trans = String(depth) + " " + String(pressure) + " " + String(time) + "\n";
 	  transmitData = transmitData + trans;
-	  //sendData(pressure, depth, timeNow);
           lastSendTime = millis();
           packetcount++;
         }
@@ -224,21 +223,17 @@ switch (currentState) {
           Serial.println("Completed");
           PumpStop();
 	  while (true) {
-	    
+	  	if (Serial.available()) {
+			sendData(transmitData);
+		}	
 	  }
   break;
     }
   }
 
-void sendData(float pressure, float depth, float time) {
-  String data = "Depth: " + String(depth) + ", Pressure: " + String(pressure) + ", Time: " + int(time);
-  
-  HC12.print(data.length());
-  HC12.print(",");
-  HC12.print("\r\n");
+void sendData(String data) {
+  //String data = "Depth: " + String(depth) + ", Pressure: " + String(pressure) + ", Time: " + int(time);
   HC12.print(data);
-  HC12.println("Sent: " + data);
-
 }
 
 void PumpIn (int speed) {
