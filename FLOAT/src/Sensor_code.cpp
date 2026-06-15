@@ -2,7 +2,6 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <Wire.h>
-#include <string>
 #include "MS5837.h"
 #include "PID.cpp"
 
@@ -10,7 +9,6 @@
 #define pumpPin1 1 //Pin 1 for Pump Connection
 #define pumpPin2 2 //Pin 2 for Pump Connection
 #define speedPin 3 //Pin for speed control
-
 
 // defines pins
 // HC12
@@ -27,16 +25,17 @@ int cyclecount = 0;
 float deepDepth = 2.5;
 float upperDepth = 0.4;
 
-int packetcount = 0;
-unsigned long lastSendTime = 0;
-unsigned long sendInterval = 5000; // Send data every 5 seconds
+int packetcount = 0;               // counts target packets during hold 
+unsigned long ContinuousTimer = 0;
+unsigned long HoldpacketTimer = 5000; // Send data every 5 seconds
+unsigned long packetInterval = 5000; // 5 seconds
 
 unsigned long holdTime = 30000;
 unsigned long holdStart = 0;
 
-string transmitData;
+String transmitData;
 
-string dataStore;
+String dataStore;
 
 enum State {
   WAIT,
@@ -57,11 +56,14 @@ struct SensorData {
 };
 
 // Function declarations
-void sendData(float pressure, float depth, float time);
+void sendData(String data);
+String formatPacket(float depth, float pressure, unsigned long timeNow);
 void PumpIn(int speed);
 void PumpOut(int speed);
 void PumpStop();
 double PID(double error);
+void logData(String packetType, float depth, float pressure, unsigned long timeNow);
+
 
 void setupSensor() {
   // HC12
@@ -111,9 +113,11 @@ switch (currentState) {
       
         if (command.indexOf("START") != -1) { // Check if the command contains "START"
           Serial.println("Sending Data...");
-          sendData(pressure, depth, timeNow); // Send initial data before diving
+          String trans = formatPacket(depth, pressure, timeNow);
+          sendData(trans); // Send initial data before diving
 
           currentState = DIVE;                // Transition to DIVE state
+          ContinuousTimer = millis();         // Initialize timer for continuous data logging
 
           holdStart = millis();
           Serial.println("Received START command. Diving...");
@@ -148,7 +152,12 @@ switch (currentState) {
             Serial.println("Reached 2.5m, holding for 30 seconds");
             currentState = HOLD_DEEP;
             holdStart = millis();
+            HoldpacketTimer = millis();
             packetcount = 0;
+          }
+          if (millis() - ContinuousTimer >= packetInterval) {
+            logData("Continuous", depth, pressure, timeNow);
+            ContinuousTimer = millis();
           }
   break;
       case HOLD_DEEP:                                                      // HOLD_DEEP - Holds at 2.5m for 30 seconds, sending data every 5 seconds
@@ -156,11 +165,13 @@ switch (currentState) {
           Serial.println("Hold time at 2.5m complete. Rising...");
           currentState = RISE;
           holdStart = millis();
+          Serial.print("Target packets collected: ");
+          Serial.println(packetcount);
           packetcount = 0;
      }
-         if (millis() - lastSendTime >= sendInterval && packetcount < 7) { // Send data every 5 seconds
-          sendData(pressure, depth, timeNow);
-          lastSendTime = millis();
+         if (millis() - HoldpacketTimer >= packetInterval) { 
+          logData("Target", depth, pressure, timeNow);
+          HoldpacketTimer = millis();
           packetcount++;
     }
   break;
@@ -194,28 +205,36 @@ switch (currentState) {
             Serial.println("Reached 0.4m, holding for 30 seconds");
             currentState = HOLD_upperdepth;
             holdStart = millis();
+            HoldpacketTimer = millis();
             packetcount = 0;
           } 
+          if (millis() - ContinuousTimer >= packetInterval) {
+            logData("Continuous", depth, pressure, timeNow);
+            ContinuousTimer = millis();
+          }
   break;
       case HOLD_upperdepth:                                              // HOLD_upperdepth - Holds at 0.4m for 30 seconds, sending data every 5 seconds
         if (millis() - holdStart >= holdTime) {    
           cyclecount++;                                                  // checks to see if 30 seconds have passed and 
           Serial.println("Hold time at 0.4m complete");
-          Serial.println("Cycle count: " + int (cyclecount));
+          Serial.println(String("Cycle count: ") + cyclecount);
         if (cyclecount < 2) {
           Serial.println("Rising complete. Diving... again");
           currentState = DIVE;
           holdStart = millis();
+          Serial.print("Target packets collected: ");
+          Serial.println(packetcount);
           packetcount = 0;
         } else {
           Serial.println("Completed final cycle");
+          Serial.print("Target packets collected: ");
+          Serial.println(packetcount);
           currentState = DONE;
         }
         }
-        if (millis() - lastSendTime >= sendInterval && packetcount < 7) { // Send data every 5 seconds
-          String trans = String(depth) + " " + String(pressure) + " " + String(time) + "\n";
-	  transmitData = transmitData + trans;
-          lastSendTime = millis();
+        if (millis() - HoldpacketTimer >= packetInterval) { 
+          logData("Target", depth, pressure, timeNow);
+          HoldpacketTimer = millis();
           packetcount++;
         }
   break;
@@ -223,7 +242,7 @@ switch (currentState) {
           Serial.println("Completed");
           PumpStop();
 	  while (true) {
-	  	if (Serial.available()) {
+	  	if (HC12.available()) {
 			sendData(transmitData);
 		}	
 	  }
@@ -234,6 +253,17 @@ switch (currentState) {
 void sendData(String data) {
   //String data = "Depth: " + String(depth) + ", Pressure: " + String(pressure) + ", Time: " + int(time);
   HC12.print(data);
+}
+
+String formatPacket(float depth, float pressure, unsigned long timeNow) {
+  String output;
+  output += String(depth, 2);
+  output += " ";
+  output += String(pressure, 2);
+  output += " ";
+  output += String(timeNow);
+  output += "\n";
+  return output;
 }
 
 void PumpIn (int speed) {
@@ -252,4 +282,8 @@ void PumpStop () {
   analogWrite(speedPin, 0);
   digitalWrite(pumpPin1, LOW);
   digitalWrite(pumpPin2, LOW);
+}
+void logData(String packetType, float depth, float pressure, unsigned long timeNow) {
+  String trans = "[" + packetType + "] " + String(depth) + " " + String(pressure) + " " + String(timeNow) + "\n";
+  transmitData += trans;
 }
