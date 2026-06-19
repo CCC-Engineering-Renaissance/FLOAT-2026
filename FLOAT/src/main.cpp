@@ -29,14 +29,14 @@
 //   HC-12 radio : Serial1 = UART0 -> GP0 (Pico TX -> HC-12 RX), GP1 (Pico RX <- HC-12 TX)
 //   BarXT (Keller): Wire = I2C0   -> GP4 (SDA), GP5 (SCL); power Vin from 5 V rail
 //                   (NOT 3.3 V), I2C pull-ups to 3.3 V.
-//   TB6612 ch A : AIN1=GP14, AIN2=GP15, PWMA=GP16, STBY=GP17 (clear of GP0/1 + I2C)
+//   TB6612 ch A : AIN1=GP10, AIN2=GP11, PWMA=GP12, STBY=GP13 (physical pins 14-17)
 //                 VM = 12 V battery, VCC = Pico 3V3, GND common. STBY must be HIGH.
 //   LED         : on-board LED instead of GP2.
 // -----------------------------------------------------------------------------
-#define PIN_PUMP_IN1  14  // TB6612 AIN1 (direction)
-#define PIN_PUMP_IN2  15  // TB6612 AIN2 (direction)
-#define PIN_PUMP_PWM  16  // TB6612 PWMA (PWM speed, 0-255)
-#define PIN_PUMP_STBY 17  // TB6612 STBY (HIGH = driver enabled; LOW = whole chip off)
+#define PIN_PUMP_IN1  10  // TB6612 AIN1 (direction)   -> physical pin 14
+#define PIN_PUMP_IN2  11  // TB6612 AIN2 (direction)   -> physical pin 15
+#define PIN_PUMP_PWM  12  // TB6612 PWMA (PWM speed)    -> physical pin 16
+#define PIN_PUMP_STBY 13  // TB6612 STBY (HIGH=enabled) -> physical pin 17
 
 #define HC12 Serial1
 static const unsigned long HC12_BAUD = 9600;
