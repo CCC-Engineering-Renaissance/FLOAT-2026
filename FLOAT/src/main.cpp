@@ -40,6 +40,7 @@
 
 #define HC12 Serial1
 static const unsigned long HC12_BAUD = 9600;
+#define BENCH_TEST   // bench testing over USB; comment out for real radio deployment
 static const unsigned long USB_BAUD  = 115200;
 
 // -----------------------------------------------------------------------------
@@ -362,8 +363,13 @@ void loop() {
 
     // A1: do nothing until a START command arrives over the radio.
     case WAIT: {
-      if (HC12.available()) {
-        String cmd = HC12.readStringUntil('\n');
+      Stream* in = nullptr;
+      if (HC12.available()) in = &HC12;
+#ifdef BENCH_TEST
+      else if (Serial.available()) in = &Serial;
+#endif
+      if (in) {
+        String cmd = in->readStringUntil('\n');
         cmd.trim();
         if (cmd.indexOf("START") != -1) {
           missionStart = millis();
