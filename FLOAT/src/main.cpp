@@ -37,7 +37,6 @@
 #define PIN_PUMP_IN2  15  // TB6612 AIN2 (direction)
 #define PIN_PUMP_PWM  16  // TB6612 PWMA (PWM speed, 0-255)
 #define PIN_PUMP_STBY 17  // TB6612 STBY (HIGH = driver enabled; LOW = whole chip off)
-#define PIN_LED       LED_BUILTIN
 
 #define HC12 Serial1
 static const unsigned long HC12_BAUD = 9600;
