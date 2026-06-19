@@ -1,66 +1,49 @@
-#include <Arduino.h>
-#include <Wire.h> //For Pressure/Depth Sensor
-#include "MS5837.h" //For Pressure/Depth Sensor
+// PID.cpp — implementation of the depth-hold controller (see PID.h).
+#include "PID.h"
 
-#define pumpPin1 1 //Pin 1 for Pump Connection
-#define pumpPin2 2 //Pin 2 for Pump Connection
-#define speedPin 3 //Pin for speed control
-MS5837 sensor; //Defines Pressure/Depth Sensor
+PID::PID(double kp, double ki, double kd, double outMin, double outMax)
+    : _kp(kp), _ki(ki), _kd(kd),
+      _outMin(outMin), _outMax(outMax),
+      _integral(0.0), _prevError(0.0), _firstStep(true) {}
 
-//Gain constants for Proportional, Integral, and Derivative respectivley. MUST be fine tuned
-double kp {1};
-double ki {1};
-double kd {1};
-
-//Defining Variables
-double integral {};
-double previousError {};
-double targetDepth {2.5};
-
-double flowRate {}; //What the PID is changing
-double dt {};
-double lastTime {0}; //Initialize lastTime. Starts at 0 seconds.
-
-
-void setup() {
-
-  pinMode(pumpPin1, OUTPUT);
-  pinMode(pumpPin2, OUTPUT);
-  pinMode(speedPin, OUTPUT);
-  Wire.begin();              // Initialize I2C bus
-  sensor.init();             // Initialize the sensor
-  sensor.setModel(MS5837::MS5837_30BA); //Sets the model of pressure sensor used
-  sensor.setFluidDensity(1021.925); //Sets fluid density of EGADS
-  
+void PID::reset() {
+  _integral  = 0.0;
+  _prevError = 0.0;
+  _firstStep = true;
 }
 
-// put function declarations here:
-double PID(double error);
-
-void loop() {
-  //Tracks time passed since start
-  double cTime = millis(); //Current time in milliseconds
-  dt = (cTime - lastTime)/1000.00; //Change in time Delta t. Divide by 1000 to convert ms to s.
-  lastTime = cTime;
-
-  //Measuring depth and returning the error value
-  sensor.read(); //Reads the depth it is currently at
-  double actualDepth = sensor.depth();
-  double error = targetDepth - actualDepth; //Gets error value to plug into PID
-  flowRate = PID(error); //Outputs some value. This value will be used to determine whether or not the FLOAT needs to adjust up or down.
-  Serial.print("Hello");
-
-  //Correlate flowRate to actual running of pump
-  
+void PID::setGains(double kp, double ki, double kd) {
+  _kp = kp;
+  _ki = ki;
+  _kd = kd;
 }
 
-// put function definitions here:
-double PID(double error){
+double PID::compute(double error, double dt) {
+  if (dt <= 0.0) dt = 1e-3;  // guard against a zero/negative timestep
 
-double proportional = error;
- integral += error * dt; //Adding because we are taking the sum of the approximation of the area under the curve.
- double derivative = (error - previousError)/dt;
- previousError = error;
- double output = (kp * proportional) + (ki * integral) + (kd * derivative);
- return output;
+  // Derivative on error. Skip on the first step so a cold start (large
+  // (error - 0)/dt) does not produce a derivative kick.
+  double derivative = _firstStep ? 0.0 : (error - _prevError) / dt;
+  _prevError = error;
+  _firstStep = false;
+
+  // Tentative integral including this step.
+  double candidateIntegral = _integral + error * dt;
+  double output = _kp * error + _ki * candidateIntegral + _kd * derivative;
+
+  // Output limiting + conditional-integration anti-windup (A2):
+  // only commit the new integral when the output is NOT saturated, OR when the
+  // current error would push the output back out of saturation. This stops the
+  // integral from accumulating while the pump is already maxed out.
+  if (output > _outMax) {
+    output = _outMax;
+    if (error < 0.0) _integral = candidateIntegral;  // error pulls back -> allow
+  } else if (output < _outMin) {
+    output = _outMin;
+    if (error > 0.0) _integral = candidateIntegral;
+  } else {
+    _integral = candidateIntegral;
+  }
+
+  return output;
 }
