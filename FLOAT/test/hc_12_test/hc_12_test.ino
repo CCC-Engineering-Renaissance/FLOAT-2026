@@ -10,9 +10,9 @@
  *   stops on its own and re-arms so the chain can be re-tested by sending
  *   another signal, without reflashing or power-cycling.
  *
- * BUILD: this file has no PlatformIO env of its own (same as motor_test.cpp).
- * To run it: back up FLOAT/src/main.cpp, copy this file over it, `make
- * upload`, test, then restore the real main.cpp.
+ * BUILD: arduino-cli / Arduino IDE sketch (folder name matches this file).
+ *   arduino-cli compile --fqbn <rp2350 fqbn> FLOAT/test/hc_12_test
+ *   arduino-cli upload -p <port> --fqbn <rp2350 fqbn> FLOAT/test/hc_12_test
  *
  * WIRING (matches src/main.cpp's TB6612 channel A + HC-12):
  *   HC-12 radio : Serial1 = UART0 -> GP0 (Pico TX -> HC-12 RX), GP1 (Pico RX <- HC-12 TX)
@@ -80,14 +80,27 @@ void loop() {
 
   digitalWrite(PIN_LED, (millis() / 500) % 2);   // slow blink while waiting
 
+  static unsigned long lastHeartbeat = 0;
+  if (millis() - lastHeartbeat >= 3000) {
+    lastHeartbeat = millis();
+    Serial.println("...waiting for HC-12 signal (or type a char here + Enter to trigger manually)");
+  }
+
   bool triggered = false;
   if (HC12.available()) {
-    while (HC12.available()) HC12.read();
+    Serial.print("HC12 RX:");
+    while (HC12.available()) {
+      char c = HC12.read();
+      Serial.print(' ');
+      Serial.print(c);
+    }
+    Serial.println();
     triggered = true;
   }
 #ifdef BENCH_TEST
   if (Serial.available()) {
     while (Serial.available()) Serial.read();
+    Serial.println("Manual trigger via USB Serial");
     triggered = true;
   }
 #endif
