@@ -343,7 +343,7 @@ void setup() {
 
   tareSurface();                    // A2: zero pressure to atmospheric at surface
 
-  Serial.println("FLOAT ready — waiting for START over the radio...");
+  Serial.println("FLOAT powered on — HC-12 listening for any signal to start...");
 }
 
 // =============================================================================
@@ -361,7 +361,8 @@ void loop() {
 
   switch (state) {
 
-    // A1: do nothing until a START command arrives over the radio.
+    // A1: from power-on, listen on the HC-12. The instant ANY signal arrives
+    // over the radio, start the mission — no "START" keyword required.
     case WAIT: {
       Stream* in = nullptr;
       if (HC12.available()) in = &HC12;
@@ -369,13 +370,11 @@ void loop() {
       else if (Serial.available()) in = &Serial;
 #endif
       if (in) {
-        String cmd = in->readStringUntil('\n');
-        cmd.trim();
-        if (cmd.indexOf("START") != -1) {
-          missionStart = millis();
-          Serial.println("START received — diving.");
-          enterPhase(DIVE);
-        }
+        // Drain whatever triggered us so it isn't re-read later, then go.
+        while (in->available()) in->read();
+        missionStart = millis();
+        Serial.println("Signal received — diving.");
+        enterPhase(DIVE);
       }
       break;
     }
