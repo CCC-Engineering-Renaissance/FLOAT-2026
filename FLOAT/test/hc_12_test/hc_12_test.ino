@@ -14,20 +14,20 @@
  *   arduino-cli compile --fqbn <rp2350 fqbn> FLOAT/test/hc_12_test
  *   arduino-cli upload -p <port> --fqbn <rp2350 fqbn> FLOAT/test/hc_12_test
  *
- * WIRING (matches src/main.cpp's TB6612 channel A + HC-12):
+ * WIRING (matches src/main.cpp's L298N channel A + HC-12):
  *   HC-12 radio : Serial1 = UART0 -> GP0 (Pico TX -> HC-12 RX), GP1 (Pico RX <- HC-12 TX)
- *   TB6612 ch A : AIN1=GP10, AIN2=GP11, PWMA=GP12, STBY=GP13 (driven HIGH in
- *                 software here; harmless no-op if STBY is instead hardwired
- *                 directly to 3V3 per the older note in motor_test.cpp).
+ *   L298N ch A  : IN1=GP10, IN2=GP11, ENA=GP12 (PWM speed/enable). No
+ *                 STBY-style chip-sleep pin on the L298N — if the board has an
+ *                 ENA jumper, remove it before wiring GP12 there, or the GPIO
+ *                 will be fighting a hardwired 5V tie. IN3/IN4/ENB unused.
  *   LED         : on-board LED — slow blink while waiting, solid while the
  *                 pump is running.
  */
 #include <Arduino.h>
 
-#define PIN_PUMP_IN1  10  // TB6612 AIN1 (direction)
-#define PIN_PUMP_IN2  11  // TB6612 AIN2 (direction)
-#define PIN_PUMP_PWM  12  // TB6612 PWMA (PWM speed)
-#define PIN_PUMP_STBY 13  // TB6612 STBY (HIGH = enabled)
+#define PIN_PUMP_IN1  10  // L298N IN1 (direction)
+#define PIN_PUMP_IN2  11  // L298N IN2 (direction)
+#define PIN_PUMP_PWM  12  // L298N ENA (PWM speed/enable)
 
 #define HC12 Serial1
 static const unsigned long HC12_BAUD = 9600;
@@ -58,10 +58,8 @@ void setup() {
   pinMode(PIN_PUMP_IN1, OUTPUT);
   pinMode(PIN_PUMP_IN2, OUTPUT);
   pinMode(PIN_PUMP_PWM, OUTPUT);
-  pinMode(PIN_PUMP_STBY, OUTPUT);
   pinMode(PIN_LED, OUTPUT);
-  digitalWrite(PIN_PUMP_STBY, HIGH);  // take TB6612 out of standby
-  analogWriteRange(255);  // RP2350 core defaults PWM to 0-1023; match motor_test.cpp's fix
+  analogWriteRange(255);  // RP2350 core defaults PWM to 0-1023, not 0-255
   pumpOff();
 
   Serial.println("HC-12 activation test ready - waiting for any signal...");

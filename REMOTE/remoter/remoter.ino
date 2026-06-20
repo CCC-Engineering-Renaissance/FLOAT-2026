@@ -11,6 +11,7 @@ const int HC12_TX = 17;  // TX pin
 // boot — sensor init + surface tare — before it can hear us).
 const unsigned long STARTUP_RESEND_MS = 1000;  // resend cadence
 unsigned long lastStartup = 0;                 // last time we sent "STARTUP"
+unsigned long sendCount = 0;                   // how many STARTUP packets sent so far
 bool floatResponded = false;                   // true once we hear any reply
 
 void setup() {
@@ -30,9 +31,13 @@ void loop() {
   if (!floatResponded && millis() - lastStartup >= STARTUP_RESEND_MS) {
     HC12.print("STARTUP");
     lastStartup = millis();
+    Serial.print("TX -> STARTUP  (#");
+    Serial.print(++sendCount);
+    Serial.println(")");
   }
 
   if (HC12.available()) {
+    if (!floatResponded) Serial.println(">>> Float responded — HC-12 link confirmed <<<");
     floatResponded = true;          // float is alive — stop resending
     Serial.write(HC12.read());
   }

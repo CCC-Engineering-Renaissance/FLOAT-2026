@@ -23,20 +23,23 @@
 
 // -----------------------------------------------------------------------------
 // Pin map  (A7: fixes LED 2 vs pumpPin2 2, and pumpPin1 1 vs HC-12 RX 1 / TX 0)
-// Hardware: Raspberry Pi Pico 2 (RP2350), Pololu TB6612FNG dual driver (#713),
+// Hardware: Raspberry Pi Pico 2 (RP2350), L298N dual H-bridge driver module,
 //           Blue Robotics BarXT (Keller 4LD, I2C 0x40, needs Vin > 3.65 V),
 //           HC-12 radio, 12 V peristaltic pump on driver channel A.
 //   HC-12 radio : Serial1 = UART0 -> GP0 (Pico TX -> HC-12 RX), GP1 (Pico RX <- HC-12 TX)
 //   BarXT (Keller): Wire = I2C0   -> GP4 (SDA), GP5 (SCL); power Vin from 5 V rail
 //                   (NOT 3.3 V), I2C pull-ups to 3.3 V.
-//   TB6612 ch A : AIN1=GP10, AIN2=GP11, PWMA=GP12, STBY=GP13 (physical pins 14-17)
-//                 VM = 12 V battery, VCC = Pico 3V3, GND common. STBY must be HIGH.
+//   L298N ch A  : IN1=GP10, IN2=GP11, ENA=GP12 (PWM speed/enable). No STBY-style
+//                 chip-sleep pin exists on the L298N — remove the board's ENA
+//                 jumper (if present) before wiring GP12 there, or the GPIO
+//                 will be fighting a hardwired 5 V tie. IN3/IN4/ENB (channel B)
+//                 are unused.
+//                 VM = 12 V battery, logic VCC = Pico 3V3, GND common.
 //   LED         : on-board LED instead of GP2.
 // -----------------------------------------------------------------------------
-#define PIN_PUMP_IN1  10  // TB6612 AIN1 (direction)   -> physical pin 14
-#define PIN_PUMP_IN2  11  // TB6612 AIN2 (direction)   -> physical pin 15
-#define PIN_PUMP_PWM  12  // TB6612 PWMA (PWM speed)    -> physical pin 16
-#define PIN_PUMP_STBY 13  // TB6612 STBY (HIGH=enabled) -> physical pin 17
+#define PIN_PUMP_IN1  10  // L298N IN1 (direction)
+#define PIN_PUMP_IN2  11  // L298N IN2 (direction)
+#define PIN_PUMP_PWM  12  // L298N ENA (PWM speed/enable)
 
 #define HC12 Serial1
 static const unsigned long HC12_BAUD = 9600;
@@ -321,9 +324,7 @@ void setup() {
   pinMode(PIN_PUMP_IN1, OUTPUT);
   pinMode(PIN_PUMP_IN2, OUTPUT);
   pinMode(PIN_PUMP_PWM, OUTPUT);
-  pinMode(PIN_PUMP_STBY, OUTPUT);
   pinMode(PIN_LED, OUTPUT);
-  digitalWrite(PIN_PUMP_STBY, HIGH);   // take TB6612 out of standby (required)
   pumpStop();
 
   Wire.begin();                     // I2C0 GP4(SDA)/GP5(SCL)
