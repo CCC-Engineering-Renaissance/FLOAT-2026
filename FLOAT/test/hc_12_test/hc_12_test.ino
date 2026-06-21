@@ -11,8 +11,10 @@
  *   another signal, without reflashing or power-cycling.
  *
  * BUILD: arduino-cli / Arduino IDE sketch (folder name matches this file).
- *   arduino-cli compile --fqbn <rp2350 fqbn> FLOAT/test/hc_12_test
- *   arduino-cli upload -p <port> --fqbn <rp2350 fqbn> FLOAT/test/hc_12_test
+ * IMPORTANT: this is a Pico 2 (RP2350) — use rpipico2, NOT rpipico (RP2040;
+ * wrong FQBN flashes fine but the board never boots into USB serial).
+ *   arduino-cli compile --fqbn rp2040:rp2040:rpipico2 FLOAT/test/hc_12_test
+ *   arduino-cli upload -p <port> --fqbn rp2040:rp2040:rpipico2 FLOAT/test/hc_12_test
  *
  * WIRING (matches src/main.cpp's L298N channel A + HC-12):
  *   HC-12 radio : Serial1 = UART0 -> GP0 (Pico TX -> HC-12 RX), GP1 (Pico RX <- HC-12 TX)
