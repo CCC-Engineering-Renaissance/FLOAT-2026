@@ -1,0 +1,305 @@
+================================================================================
+ FLOAT-2026 CODE — COMPLETE RUNDOWN
+ MATE ROV "MATE Floats! Under the Ice" vertical profiling float (non-ROV device)
+ Generated: 2026-06-22
+================================================================================
+
+This repository is the firmware + support code for a VERTICAL PROFILING FLOAT —
+a buoyancy-driven device (no thrusters) that descends to depth, holds, ascends,
+holds, repeats for two profiles, logs depth-vs-time, and transmits the data to a
+shore receiver over radio. It is a scored MATE competition deliverable (70 pts).
+
+Unlike the ROV control code, this is microcontroller firmware:
+  - Target board : Raspberry Pi Pico 2 (RP2350), Arduino framework
+  - Build system : PlatformIO (Earle Philhower arduino-pico core) + Makefile wrapper
+  - Language     : C++ / Arduino (.ino + .cpp/.h)
+
+The competition task and a detailed checklist live in REQUIREMENTS.md.
+
+
+================================================================================
+ 1. WHAT THE FLOAT HAS TO DO (mission, from REQUIREMENTS.md)
+================================================================================
+
+  - Wait for a START signal over the radio before doing anything.
+  - Descend to 2.5 m (+/-33 cm) by changing buoyancy, then HOLD.
+  - Hold 30 s, counting time only while inside the +/-33 cm band; the clock
+    resets the instant depth leaves the band.
+  - Ascend to 0.40 m (+/-33 cm) and hold the same way — WITHOUT breaking the
+    surface or touching the ice (-5 penalty), so it needs an ascent floor guard.
+  - Repeat for TWO full profiles.
+  - Sense depth (m) and pressure (kPa) from the pressure sensor; tare to
+    atmospheric at the surface; apply a sensor mounting offset.
+  - Log depth+time at least every 5 s (7 points per hold: 0,5,...,30 s),
+    >=20 packets total, in a BOUNDED buffer (no heap growth on the Pico).
+  - After recovery, transmit packets discretely (one at a time, delimited), each
+    tagged with the company number so the shore receiver can filter this float.
+  - On sensor failure or inability to hold: surface and stop the pump (fail safe).
+
+Scope split:
+  A. Float firmware (on-board)         <- this repo's FLOAT/ folder
+  B. Receiver + graph tool (shore PC)  <- NOT in this repo yet
+  C. Hardware + documentation          <- physical build / paperwork (not code)
+
+
+================================================================================
+ 2. REPO LAYOUT
+================================================================================
+
+  FLOAT/src/main/main.ino   — THE firmware (single setup()/loop()). ACTIVE.
+  FLOAT/src/main/PID.h/.cpp  — depth-hold PID controller (proper class). ACTIVE.
+  FLOAT/src/PID.h/.cpp       — DUPLICATE copy of the PID class (identical).
+  FLOAT/platformio.ini       — PlatformIO env for Pico 2 + KellerLD library.
+  FLOAT/Makefile             — convenience wrapper over PlatformIO (build/flash/monitor).
+  FLOAT/test/*               — three hardware bring-up sketches (HC-12 radio tests).
+  REMOTE/remoter/remoter.ino — the SHORE-SIDE remote that sends START + relays data.
+  TBP/src/main.cpp           — older naive "timed pump" version. LEGACY/reference.
+  PID/                       — empty PlatformIO scaffold (.vscode only).
+  REQUIREMENTS.md            — mission spec + checklist.
+  README.md                  — stub (just the title).
+
+
+================================================================================
+ 3. THE FIRMWARE — FLOAT/src/main/main.ino
+================================================================================
+
+HARDWARE / PIN MAP
+  - MCU         : Raspberry Pi Pico 2 (RP2350)
+  - Pressure    : Blue Robotics BarXT = Keller 4LD (I2C 0x40, KellerLD library,
+                  NOT the MS5837). Wire = I2C0 -> GP4 (SDA), GP5 (SCL). Needs
+                  Vin > 3.65 V (powered from 5 V rail).
+  - Radio       : HC-12 on Serial1 (UART0) -> GP0 (TX), GP1 (RX), 9600 baud.
+  - Buoyancy    : 12 V peristaltic pump via L298N dual H-bridge, channel A:
+                  IN1=GP10, IN2=GP11, ENA(PWM)=GP12.
+  - LED         : on-board LED (PIN_LED) for heartbeat.
+  - BENCH_TEST  : a #define that also accepts the START trigger over USB serial
+                  for dry testing (comment out for real radio deployment).
+
+BUOYANCY ENGINE MODEL
+  pumpIn(speed)  -> water IN  -> heavier -> descend
+  pumpOut(speed) -> water OUT -> lighter -> ascend
+  pumpStop()     -> coast (both H-bridge inputs LOW, PWM 0)
+
+SENSING (readSensor)
+  - Reads the Keller sensor, validates the reading (300..20000 mbar, not NaN).
+  - Computes GAUGE pressure (abs - surfaceMbar) so the surface tare makes
+    depth == 0 at the surface, converts to kPa, and derives depth from
+    gauge pressure using configurable FLUID_DENSITY (997 fresh / ~1029 sea) and
+    gravity, then adds SENSOR_MOUNT_OFFSET_M.
+  - Also derives a vertical VELOCITY estimate (m/s) from the change in depth
+    between reads, smoothed with an exponential moving average (software only,
+    no extra sensor). Used for USB tuning telemetry, not control.
+  - tareSurface() averages 20 samples at startup to set surfaceMbar.
+
+CONTROL (controlDepth + PID)
+  - error = setpoint_depth - measured_depth.
+  - PID.compute(error, dt) returns a signed effort in [-255, 255].
+  - output > 0 -> pumpIn (descend); output < 0 -> pumpOut (ascend); 0 -> stop.
+  - protectSurface flag: during the shallow hold, if depth <= ASCENT_FLOOR
+    (0.25 m) the pump is stopped instead of pumping out — the surface/ice guard.
+
+PID CLASS (PID.h / PID.cpp)
+  - Standard PID on error with: zero-dt guard, derivative-on-error with a
+    first-step skip (no derivative kick on cold start), output clamping, and
+    CONDITIONAL-INTEGRATION anti-windup (the integral only accumulates when the
+    output isn't saturated, or when the current error would pull it back out of
+    saturation). reset() clears memory on every state transition.
+
+MISSION STATE MACHINE (loop)
+  States: WAIT -> DIVE -> HOLD_DEEP -> RISE -> HOLD_SHALLOW -> (loop x2) -> DONE
+          plus FAULT from any active phase.
+  - WAIT  : any byte over HC-12 (or USB under BENCH_TEST) starts the mission.
+  - DIVE  : controlDepth toward 2.5 m; transitions to HOLD_DEEP when in band;
+            MAX_PHASE_MS (120 s) watchdog -> FAULT if it can't get there.
+  - HOLD_DEEP / HOLD_SHALLOW : serviceHold counts 30 s only while in band,
+            resets the clock + packet cadence on leaving the band, logs a packet
+            every 5 s while in band.
+  - RISE  : controlDepth toward 0.40 m with the surface guard ON.
+  - DONE  : pump off; transmitNext() sends buffered packets one at a time.
+  - FAULT : pump OUT at full power for FAULT_SURFACE_MS (8 s) to guarantee
+            surfacing, then stop and fall through to DONE (still transmit data).
+
+LOGGING (A3)
+  - Bounded fixed array packets[MAX_PACKETS=80]; stops appending when full
+    (never reached in one mission). Each packet = {seconds, depth, kPa}.
+
+PACKET FORMAT / TRANSMIT (A4/A5)
+  - formatPacket -> "EX01 1:51:42 9.8 kPa 1.00 m" (company + HH:MM:SS + kPa + m).
+    Uses String(float,2) to dodge Pico printf-float linker issues.
+  - transmitNext sends ONE packet per call, newline-delimited, cycling the
+    buffer, spaced by TRANSMIT_GAP (300 ms) — replaces the old per-byte blob blast.
+
+HEARTBEAT
+  - LED blink rate encodes state: slow (WAIT), medium (active), fast (FAULT).
+
+KEY TUNABLE CONSTANTS (top of main.ino)
+  DEEP_DEPTH 2.50 m, SHALLOW_DEPTH 0.40 m, BAND 0.33 m, ASCENT_FLOOR 0.25 m,
+  FLUID_DENSITY 997, PWM_MAX 255, KP/KI/KD = 100/5/20 (PLACEHOLDERS, tune in
+  water), HOLD_MS 30 s, PACKET_INTERVAL 5 s, MAX_PHASE_MS 120 s,
+  FAULT_SURFACE_MS 8 s, PROFILES 2, MAX_PACKETS 80.
+
+
+================================================================================
+ 4. THE SHORE REMOTE — REMOTE/remoter/remoter.ino
+================================================================================
+
+A second microcontroller (HC-12 on UART2, GP16/17) that:
+  - Resends "STARTUP" every 1 s until the float replies, so power-on order
+    between float and remote doesn't matter (the float boots slowly: sensor init
+    + surface tare).
+  - Stops spamming once it hears any reply ("float responded — link confirmed").
+  - Acts as a bidirectional bridge: float -> USB serial (so a PC can capture the
+    transmitted packets), and USB -> float.
+
+NOTE: this is the radio bridge, NOT the full "receiver + graph tool" (Scope B).
+The graphing program that filters by company number and plots depth-vs-time on a
+computer does not exist in this repo yet.
+
+
+================================================================================
+ 5. LEGACY / SCAFFOLD CODE
+================================================================================
+
+TBP/src/main.cpp  — the older "timed pump" approach
+  - Runs the pump for fixed delay(1000) bursts in a 4-case for-loop, no closed
+    loop on depth. Hold is triggered by `sensor.depth() == 2.5` / `== 0.4`
+    EXACT float equality, which will essentially never be true -> the 30 s holds
+    never actually fire. Uses the MS5837 library (different sensor than the
+    active firmware's Keller). Kept as reference; should be excluded from build.
+
+PID/  — empty PlatformIO project scaffold (only .vscode/extensions.json).
+
+FLOAT/test/*  — three bring-up sketches for the HC-12 radio (AT-command bridge,
+  link test, Serial1 loopback). Useful hardware diagnostics, not part of the
+  mission firmware.
+
+
+================================================================================
+ 6. PROS OF THE CODE
+================================================================================
+
+REQUIREMENTS-DRIVEN & WELL ORGANIZED
+  + The firmware is explicitly mapped to the competition requirements (A1..A7
+    tags in comments and a dedicated REQUIREMENTS.md). Every mission rule has an
+    identifiable piece of code, which makes scoring/verification straightforward.
+  + Clean single-program structure: one setup()/loop(), a real PID class, and
+    well-separated helpers (readSensor / controlDepth / serviceHold / logPacket /
+    formatPacket / transmitNext). This is a big improvement over the legacy TBP
+    sketch.
+
+CORRECT, SAFETY-CONSCIOUS MISSION LOGIC
+  + The in-band hold timing is implemented exactly to the rules: the 30 s clock
+    and the 5 s packet cadence both reset the instant depth leaves the +/-33 cm
+    band, so "holding depth" is provable with 7 sequential in-band packets.
+  + Surface/ice guard (ASCENT_FLOOR) prevents the -5 penalty during the shallow
+    hold by refusing to pump out above 0.25 m.
+  + Real fault handling (A6): repeated bad sensor reads or a phase watchdog
+    timeout drive a FAULT state that pumps to the surface, stops, and still
+    transmits whatever was logged — it never just hangs underwater.
+  + Bounded init retries on the sensor (won't spin forever if the sensor is dead).
+
+GOOD CONTROL ENGINEERING
+  + The PID has the right details for this application: conditional-integration
+    anti-windup (critical for a slow pump that saturates easily), derivative
+    first-step skip (no startup kick), zero-dt guard, output clamping, and a
+    reset() called on every phase change so holds don't inherit stale integral.
+  + Depth is derived from GAUGE pressure with a startup surface tare and a
+    configurable fluid density + mount offset, so the reported depth matches the
+    rules' reference point and reads 0 at the surface.
+
+ROBUST DATA HANDLING
+  + Bounded fixed-size packet buffer (no ever-growing String) — avoids
+    heap-exhaustion, a real risk on the RP2040/RP2350.
+  + Discrete, company-tagged, newline-delimited transmission so the shore
+    receiver can filter this float even while other teams transmit at once.
+  + String(float,2) formatting sidesteps known Pico printf-float linker issues.
+
+OPERATIONS / DX
+  + The shore remote auto-retries START until the float answers, making power-on
+    order irrelevant — a thoughtful field-usability touch.
+  + BENCH_TEST lets you trigger and watch the whole mission over USB with no
+    radio, plus 1 Hz depth/velocity telemetry for tuning.
+  + Makefile wraps PlatformIO with memorable build/flash/monitor targets and even
+    documents the WSL2 USB caveat.
+
+
+================================================================================
+ 7. CONS / RISKS / TECH DEBT
+================================================================================
+
+DUPLICATION & DEAD CODE
+  - PID.h/.cpp exist TWICE: FLOAT/src/main/ and FLOAT/src/ are byte-identical
+    copies. Depending on PlatformIO's source filter this risks a duplicate-symbol
+    link error or silent divergence later. Keep one copy.
+  - TBP/src/main.cpp is a parallel, naive version that uses `==` float equality
+    (`sensor.depth() == 2.5`) that effectively never triggers, and targets a
+    DIFFERENT sensor (MS5837 vs the active Keller). It should be clearly archived
+    or excluded from the build so nobody flashes it by mistake.
+  - PID/ is an empty scaffold adding noise. README.md is just a title.
+
+CONFIGURATION NOT YET FIELD-READY (mostly flagged in-code, but still open)
+  - PID gains (KP/KI/KD = 100/5/20) are explicitly PLACEHOLDERS — never tuned in
+    water. Depth-hold behavior is unknown until pool tested; wrong gains could
+    oscillate across the band (failing the 7-in-band-packet requirement) or
+    saturate the slow pump.
+  - SENSOR_MOUNT_OFFSET_M is 0.00 — must be measured on the built float and
+    recorded for the judge, or reported depth won't match the rules' reference.
+  - FLUID_DENSITY defaults to fresh water (997); must be set for the actual
+    competition water.
+
+MISSION-LOGIC EDGE CASES
+  - The hold/transition logic uses "within band" to BOTH start counting and to
+    decide a transit phase is complete. There's no settle/debounce, so a single
+    noisy in-band sample at the edge of DIVE can prematurely declare arrival and
+    flip to HOLD; conversely noise can repeatedly reset a nearly-complete hold.
+    Some hysteresis or an N-consecutive-samples requirement would harden this.
+  - DIVE/RISE share holdStart/holdPacketTimer bookkeeping set in several places
+    (enterPhase, and again inline on arrival) — easy to get subtly out of sync as
+    the code evolves.
+  - The pump is commanded directly from PID output every loop with no rate limit
+    or minimum-on time; a peristaltic pump being toggled rapidly near zero output
+    may chatter. A small output deadband would help.
+  - No depth/velocity sanity cross-check before committing to a 30 s hold; if the
+    sensor reads plausibly but wrongly (in-range but off), the float could "hold"
+    at the wrong depth and still log confident packets.
+
+COMMS / RECEIVER GAPS
+  - The START trigger is "ANY byte received" — robust, but also means stray RF or
+    another team's traffic on the same HC-12 channel/address could start the
+    mission early. Consider requiring the actual company tag or a keyword.
+  - The Scope-B receiver + graphing tool (filter by company number, plot
+    depth-vs-time, >=20 packets) does NOT exist in this repo. That's a scored
+    deliverable (up to 20 pts) currently unrepresented in code.
+  - HC-12 transmission is fire-and-forget (no ack/retry per packet). With other
+    teams transmitting simultaneously, some packets may be lost; cycling the
+    buffer helps but there's no confirmation the shore side got >=20.
+
+PORTABILITY / BUILD
+  - Pin map and sensor choice are hard-coded #defines spread in the firmware;
+    fine for one board, but there's no single config header shared with the TBP/
+    test variants, so the duplicate sketches reference different pins/sensors.
+  - No automated tests (expected for Arduino firmware, but the pure logic —
+    depth conversion, hold timing, PID — could be unit-tested off-target like the
+    ROV repo does, to catch regressions without a pool).
+
+
+================================================================================
+ 8. SUMMARY
+================================================================================
+
+The active FLOAT firmware (FLOAT/src/main/main.ino + the PID class) is a
+genuinely solid, requirements-traceable implementation of the MATE profiling-
+float mission: correct in-band hold timing, a proper anti-windup PID, a surface/
+ice guard, real fault-to-surface handling, a bounded packet buffer, and
+discrete, company-tagged radio transmission. Its weaknesses are mostly
+non-algorithmic: duplicated PID files, a misleading legacy TBP sketch that should
+be archived, and field-config values (PID gains, mount offset, fluid density)
+that are still placeholders awaiting in-water tuning. The biggest OUTSTANDING
+gap is external to the firmware — the shore-side receiver/graphing tool (a scored
+deliverable) isn't written yet. Cleaning up the duplicates/legacy code, adding a
+little hold/transition hysteresis, tuning in water, and building the receiver
+would make this competition-ready.
+
+================================================================================
+ END
+================================================================================
