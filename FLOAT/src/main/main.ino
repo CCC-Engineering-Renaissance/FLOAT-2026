@@ -72,6 +72,10 @@ static const int   PWM_MAX        = 255;     // pump speed ceiling / PID output 
 // A2: PID gains are PLACEHOLDERS — tune in water. (Old code used {1,1,1}.)
 static const double KP = 100.0, KI = 5.0, KD = 20.0;
 
+// Vertical-velocity estimate: pressure is noisy, so the derived rate is smoothed
+// with an exponential moving average. 0..1; higher = more responsive, noisier.
+static const float VELOCITY_EMA_ALPHA = 0.30f;
+
 static const unsigned long HOLD_MS         = 30000;   // A1: 30 s in-band hold
 static const unsigned long PACKET_INTERVAL = 5000;    // A3: log at least every 5 s
 static const unsigned long TRANSMIT_GAP    = 300;     // A5: spacing between discrete packets
@@ -110,6 +114,7 @@ static float  surfaceMbar = 1013.25f;
 // live measurements (refreshed each loop)
 static float  g_depth = 0.0f;
 static float  g_kpa   = 0.0f;
+static float  g_velocity = 0.0f;   // m/s, +descending; derived from depth (no extra sensor)
 static bool   g_sensorOk = false;
 static int    g_readFail = 0;
 
@@ -164,6 +169,24 @@ static bool readSensor() {
   float gaugeMbar = absMbar - surfaceMbar;
   g_kpa   = gaugeMbar / 10.0f;              // 1 mbar = 0.1 kPa
   g_depth = (gaugeMbar * 100.0f) / (FLUID_DENSITY * GRAVITY) + SENSOR_MOUNT_OFFSET_M;
+
+  // Vertical velocity (m/s) from the change in depth between good reads, smoothed
+  // with an EMA to tame pressure noise. Positive = descending. Software only.
+  static bool          havePrev  = false;
+  static float         prevDepth = 0.0f;
+  static unsigned long prevMs    = 0;
+  unsigned long nowMs = millis();
+  if (havePrev) {
+    float dt = (nowMs - prevMs) / 1000.0f;
+    if (dt > 0.0f) {
+      float rawVel = (g_depth - prevDepth) / dt;
+      g_velocity += VELOCITY_EMA_ALPHA * (rawVel - g_velocity);
+    }
+  }
+  prevDepth = g_depth;
+  prevMs    = nowMs;
+  havePrev  = true;
+
   g_sensorOk = true;
   return true;
 }
@@ -358,6 +381,16 @@ void loop() {
     g_readFail = 0;
   } else if (++g_readFail >= FAULT_READ_LIMIT && isActiveMission(state)) {
     enterFault("repeated sensor read failures");
+  }
+
+  // USB-only velocity telemetry (1 Hz) — handy for tuning the depth loop without
+  // touching the radio packet format. Does not affect control.
+  static unsigned long velDbgTimer = 0;
+  if (isActiveMission(state) && millis() - velDbgTimer >= 1000) {
+    velDbgTimer = millis();
+    Serial.print("depth "); Serial.print(g_depth, 2);
+    Serial.print(" m  vel "); Serial.print(g_velocity, 3);
+    Serial.println(" m/s");
   }
 
   switch (state) {
