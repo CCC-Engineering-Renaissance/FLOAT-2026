@@ -31,9 +31,14 @@ void loop() {
   if (!floatResponded && millis() - lastStartup >= STARTUP_RESEND_MS) {
     HC12.print("STARTUP");
     lastStartup = millis();
-    Serial.print("TX -> STARTUP  (#");
+    // Debug monitor: keep writing to the USB serial terminal once per second
+    // while we wait, so you can confirm the remote is alive and how many nudges
+    // have gone out. Stops the moment the float replies over HC-12.
+    Serial.print("WAITING for float — TX STARTUP (#");
     Serial.print(++sendCount);
-    Serial.println(")");
+    Serial.print(")  t=");
+    Serial.print(millis() / 1000);
+    Serial.println("s");
   }
 
   if (HC12.available()) {

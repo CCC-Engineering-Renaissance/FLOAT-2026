@@ -398,6 +398,22 @@ void loop() {
     // A1: from power-on, listen on the HC-12. The instant ANY signal arrives
     // over the radio, start the mission — no "START" keyword required.
     case WAIT: {
+      // Debug monitor: keep writing to the USB serial terminal once per second
+      // while we wait, so you can confirm the firmware is alive and watch the
+      // live sensor reading. Stops the moment an HC-12 signal starts the mission.
+      if (millis() - continuousTimer >= 1000) {
+        continuousTimer = millis();
+        Serial.print("WAITING for HC-12 signal | depth=");
+        Serial.print(g_depth, 2);
+        Serial.print(" m  kPa=");
+        Serial.print(g_kpa, 2);
+        Serial.print("  sensor=");
+        Serial.print(g_sensorOk ? "OK" : "FAIL");
+        Serial.print("  t=");
+        Serial.print(millis() / 1000);
+        Serial.println("s");
+      }
+
       Stream* in = nullptr;
       if (HC12.available()) in = &HC12;
 #ifdef BENCH_TEST
