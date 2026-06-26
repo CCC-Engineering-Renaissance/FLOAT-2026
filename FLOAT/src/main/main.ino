@@ -1,48 +1,50 @@
 // =============================================================================
 // FLOAT-2026 firmware  —  MATE "MATE Floats! Under the Ice" vertical profiler
-// SENSORLESS build: NO pressure sensor. Single setup()/loop(), Arduino framework,
-// Seeed Studio XIAO ESP32-S3.
+// ESP32-S3 WROOM, Arduino framework, single setup()/loop().
 //
-// HOW THIS WORKS WITHOUT A DEPTH SENSOR
-// -------------------------------------
-// There is no way to *measure* depth without a pressure sensor, so this firmware
-// does NOT close a loop on depth. Instead it runs OPEN-LOOP buoyancy scheduling:
+// SENSOR + FALLBACK build. Primary control is CLOSED-LOOP PID on a Keller LD
+// (BarXT) pressure sensor read over I2C. If that sensor never initializes (or
+// fails mid-run) the firmware degrades gracefully to the OPEN-LOOP dead-reckoning
+// estimator below — the mission still runs DIVE -> HOLD -> RISE -> HOLD x2 to
+// completion. The sensor is never a hard blocker.
 //
-//   1. The pump is positive-displacement (peristaltic), so water moved = flow_rate
-//      * run_time. We integrate pump run-time to track how much water is in the
-//      IV-bag reservoir (`ballast_ml`) — this IS observable and reliable.
-//   2. Each mission phase servos `ballast_ml` to a target volume (heavy = dive,
-//      light = rise, neutral = hold). A real closed loop, but on BALLAST not depth.
-//   3. A dead-reckoning model integrates the equation of motion (buoyancy - weight
-//      - drag) to ESTIMATE depth/velocity, used to sequence phases and fill the
-//      logged graph. It is an ESTIMATE, not a measurement.
+//   sensor present & healthy  ->  PID holds MEASURED depth (g_depth), tight band.
+//   sensor absent / failed    ->  open-loop ballast schedule + dead-reckoned
+//                                 est_depth + per-phase timeouts (best effort).
 //
-// HONEST LIMITATIONS — READ THIS
-//   * The depth estimate DRIFTS. A sub-1% trim/volume error walks the float out of
-//     the ±33 cm band in a few seconds with no way to correct it. "Hold" is
-//     best-effort, not a guaranteed ±33 cm.
-//   * Calibrate phase timing in the pool: measure the real descend/ascend time and
-//     set DIVE_TIMEOUT_MS / RISE_TIMEOUT_MS so phases end even if the model drifts.
-//   * BUOYANCY BUDGET still applies (see constants): at 12 lb in a 2.56 L hull the
-//     float is ~2.8 kg negative and physically cannot rise. No code fixes that.
+// HONEST LIMITATIONS (fallback mode only)
+//   * The dead-reckoned depth DRIFTS — "hold" is best-effort, not guaranteed
+//     +/-33 cm. Calibrate DIVE_TIMEOUT_MS / RISE_TIMEOUT_MS in the pool so phases
+//     end even when the estimate drifts.
+//   * BUOYANCY BUDGET still applies: at 12 lb in a 2.56 L hull the float is
+//     ~2.8 kg negative and physically cannot rise. No code fixes that.
 // =============================================================================
 #include <Arduino.h>
+#include <Wire.h>
+#include "KellerLD.h"   // BarXT = Keller 4LD sensor (NOT MS5837)
+#include "PID.h"
 
 // -----------------------------------------------------------------------------
-// Pin map for Seeed Studio XIAO ESP32-S3.
-//   HC-12 radio : Serial1 -> D6/GPIO43 (XIAO TX -> HC-12 RX),
-//                           D7/GPIO44 (XIAO RX <- HC-12 TX)
-//   L298N ch A  : IN1=D1/GPIO2, IN2=D2/GPIO3, ENA=D0/GPIO1 (PWM speed/enable).
-//                 VM = 12 V battery, logic VCC = XIAO 3V3, GND common.
-//   LED         : XIAO user LED = GPIO21 (active-LOW).
-// (The former I2C pins for the Keller sensor are no longer used — sensorless.)
+// Pin map for ESP32-S3 WROOM.
+//   HC-12 radio : Serial1 -> GPIO43 (ESP32 TX -> HC-12 RX),
+//                           GPIO44 (ESP32 RX <- HC-12 TX).
+//                 (Serial console runs over native USB-CDC, so 43/44 are free —
+//                  build with -D ARDUINO_USB_CDC_ON_BOOT=1, see platformio.ini.)
+//   Keller LD   : Wire -> GPIO1 (SDA), GPIO2 (SCL); sensor Vin > 3.65 V.
+//   L298N ch A  : IN1=GPIO5, IN2=GPIO6, ENA=GPIO4 (PWM speed/enable).
+//                 VM = 12 V battery, logic VCC = 3V3, GND common.
+//   LED         : user LED on GPIO21 (cosmetic heartbeat; harmless if absent).
 // -----------------------------------------------------------------------------
-#define PIN_PUMP_IN1  2   // D1/GPIO2: L298N IN1 (direction)
-#define PIN_PUMP_IN2  3   // D2/GPIO3: L298N IN2 (direction)
-#define PIN_PUMP_PWM  1   // D0/GPIO1: L298N ENA (PWM speed/enable)
-#define PIN_LED       21  // XIAO S3 user LED (active-LOW)
-#define HC12_RX_PIN   44  // D7/GPIO44: XIAO RX <- HC-12 TX
-#define HC12_TX_PIN   43  // D6/GPIO43: XIAO TX -> HC-12 RX
+#define PIN_PUMP_IN1  5    // L298N IN1 (direction)
+#define PIN_PUMP_IN2  6    // L298N IN2 (direction)
+#define PIN_PUMP_PWM  4    // L298N ENA (PWM speed/enable)
+#define PIN_LED       21   // user LED (active-LOW)
+#define LED_ON        LOW
+#define LED_OFF       HIGH
+#define HC12_RX_PIN   44   // ESP32 RX <- HC-12 TX
+#define HC12_TX_PIN   43   // ESP32 TX -> HC-12 RX
+#define I2C_SDA_PIN   1    // Keller SDA
+#define I2C_SCL_PIN   2    // Keller SCL
 
 #define HC12 Serial1
 static const unsigned long HC12_BAUD = 9600;
@@ -65,7 +67,12 @@ static const float ASCENT_FLOOR   = 0.25f;   // A1: never rise above this (no su
 static const float FLUID_DENSITY  = 1025.0f; // kg/m^3
 static const float GRAVITY        = 9.80665f;   // m/s^2
 
-static const int   PWM_MAX        = 255;     // pump speed ceiling
+static const int   PWM_MAX        = 255;     // pump speed ceiling / PID output limit
+static const double KP = 100.0, KI = 5.0, KD = 20.0;  // PLACEHOLDER gains (A2: tune in water)
+static const float SENSOR_MOUNT_OFFSET_M = 0.00f;     // A2: sensor-to-reference offset (m)
+
+// Sensor health: if the sensor was present but reads have been bad this long, fault.
+static const unsigned long SENSOR_FAIL_MS = 3000;
 
 // -----------------------------------------------------------------------------
 // Physical / hardware measurements (as-built float). The sensorless model and the
@@ -90,17 +97,15 @@ static const float ADDED_MASS_CA        = 0.5f;             // entrained-water c
 // BUOYANCY BUDGET — buoyancy @1025 = 1025 * 2.5575e-3 = 2.62 kg; net = 2.62 - 5.44 =
 //   -2.82 kg. The float is ~2.8 kg NEGATIVE; the 200 mL engine swings only ~+/-0.2 kg.
 // WARNING: with this mass/displacement the float CANNOT float or rise — empty bags
-//   still sink. DIVE will work; RISE/HOLD will time out into FAULT. The model below
-//   reflects this honestly (its estimated depth just keeps increasing). The fix is
-//   physical: ~5.6 lb mass OR ~5.4 L displacement (add a sealed ~2.85 L air chamber).
+//   still sink. The fix is physical: ~5.6 lb mass OR ~5.4 L displacement.
 
 // Per-phase ballast targets (mL). Dive = heaviest, rise = lightest, hold = neutral.
 static const float DIVE_BALLAST_ML = BALLAST_ML;   // full -> sink
 static const float RISE_BALLAST_ML = 0.0f;         // empty -> rise
 static const float BALLAST_TOL_ML  = 2.0f;         // servo deadband
 
-// Phase timeouts. PRIMARY phase end is the estimated-depth trigger; these are the
-// fallbacks so a phase always ends even when the estimate drifts. CALIBRATE in pool.
+// Phase timeouts. PRIMARY phase end is the depth trigger; these are the fallbacks so
+// a phase always ends even when the (fallback) estimate drifts. CALIBRATE in pool.
 static const unsigned long DIVE_TIMEOUT_MS = FULL_STROKE_MS + 90000;  // ~166 s
 static const unsigned long RISE_TIMEOUT_MS = FULL_STROKE_MS + 90000;  // ~166 s
 static const unsigned long HOLD_TIMEOUT_MS = 120000;                  // give up holding -> FAULT
@@ -120,9 +125,12 @@ enum State { WAIT, DIVE, HOLD_DEEP, RISE, HOLD_SHALLOW, DONE, FAULT };
 
 struct Packet {
   unsigned long t;   // seconds since START
-  float depth;       // m  (ESTIMATED, dead-reckoned — not measured)
-  float kpa;         // kPa (derived from estimated depth)
+  float depth;       // m  (measured when sensor healthy, else ESTIMATED)
+  float kpa;         // kPa
 };
+
+static KellerLD sensor;
+static PID      depthPid(KP, KI, KD, -PWM_MAX, PWM_MAX);
 
 static State  state = WAIT;
 static int    cycle = 0;
@@ -132,7 +140,19 @@ static int    packetCount    = 0;
 static int    transmitIndex  = 0;
 
 // -----------------------------------------------------------------------------
-// Sensorless estimator state (dead reckoning)
+// Sensor state. surfaceMbar is the startup tare so depth == 0 at the surface.
+//   g_sensorPresent : sensor initialized at boot.
+//   g_sensorOk      : last read was plausible.
+// -----------------------------------------------------------------------------
+static float surfaceMbar     = 1013.25f;
+static float g_depth         = 0.0f;   // m  (tared, mount-offset applied)
+static float g_kpa           = 0.0f;   // kPa (gauge)
+static bool  g_sensorOk      = false;
+static bool  g_sensorPresent = false;
+static unsigned long sensorBadSince = 0; // when reads first went bad (0 = healthy)
+
+// -----------------------------------------------------------------------------
+// Sensorless estimator state (dead reckoning) — the fallback.
 //   ballast_ml : water in the IV bags, tracked from pump run-time (observable)
 //   pump_dir   : +1 pumping IN (heavier), -1 OUT (lighter), 0 stopped
 //   est_depth  : ESTIMATED depth (m, >=0). est_vel: ESTIMATED rate (+down).
@@ -146,6 +166,7 @@ static float est_kpa    = 0.0f;
 // timers
 static unsigned long missionStart   = 0;
 static unsigned long lastModelMs    = 0;
+static unsigned long lastControl    = 0;
 static unsigned long continuousTimer= 0;
 static unsigned long holdPacketTimer= 0;
 static unsigned long holdStart      = 0;
@@ -153,6 +174,14 @@ static unsigned long phaseStart     = 0;
 static unsigned long transmitTimer  = 0;
 static unsigned long faultStart     = 0;
 static unsigned long ledTimer       = 0;
+
+// -----------------------------------------------------------------------------
+// Mode select: which depth source the state machine acts on this pass.
+//   useSensor() -> true once the sensor inited AND is returning plausible reads.
+//   depthNow()  -> measured depth when healthy, else dead-reckoned estimate.
+// -----------------------------------------------------------------------------
+static bool  useSensor() { return g_sensorPresent && g_sensorOk; }
+static float depthNow()  { return useSensor() ? g_depth : est_depth; }
 
 // -----------------------------------------------------------------------------
 // Pump (buoyancy engine). Each call also sets pump_dir so the ballast integrator
@@ -182,9 +211,9 @@ static void pumpStop() {
 }
 
 // -----------------------------------------------------------------------------
-// Ballast servo: drive `ballast_ml` toward a target volume by running the pump.
-// Because the pump is positive-displacement, run-time IS volume — this loop is
-// reliable (unlike the depth estimate). Returns true when within the deadband.
+// Ballast servo (fallback control): drive `ballast_ml` toward a target volume by
+// running the pump. Positive-displacement, so run-time IS volume — reliable even
+// without a depth sensor. Returns true when within the deadband.
 // -----------------------------------------------------------------------------
 static bool servoBallast(float target_ml) {
   if (ballast_ml < target_ml - BALLAST_TOL_ML)      { pumpIn(PWM_MAX);  return false; }
@@ -202,8 +231,88 @@ static float neutralBallastMl() {
 }
 
 // -----------------------------------------------------------------------------
-// Sensorless model update (dead reckoning). Integrates ballast from pump run-time,
-// then integrates the vertical equation of motion to estimate velocity and depth.
+// Closed-loop control (sensor mode): drive the buoyancy engine toward `setpoint`
+// using the PID on MEASURED depth.
+//   error > 0 (too shallow)  -> pump IN  (descend)
+//   error < 0 (too deep)     -> pump OUT (ascend)
+// -----------------------------------------------------------------------------
+static void controlDepth(float setpoint) {
+  unsigned long now = millis();
+  double dt = (now - lastControl) / 1000.0;
+  lastControl = now;
+
+  double output = depthPid.compute(setpoint - g_depth, dt);
+
+  if (output > 0.0)      pumpIn((int)output);
+  else if (output < 0.0) pumpOut((int)(-output));
+  else                   pumpStop();
+}
+
+// -----------------------------------------------------------------------------
+// Sensing — reads the Keller LD and updates g_depth / g_kpa. Returns false on an
+// implausible reading. Depth is derived from GAUGE pressure so the surface tare
+// makes depth == 0 at the surface, then the mount offset is applied.
+// -----------------------------------------------------------------------------
+static bool readSensor() {
+  if (!g_sensorPresent) { g_sensorOk = false; return false; }
+  sensor.read();
+  float absMbar = sensor.pressure();        // mbar absolute (library default)
+  if (isnan(absMbar) || !(absMbar > 300.0f && absMbar < 20000.0f)) {
+    g_sensorOk = false;
+    return false;
+  }
+  float gaugeMbar = absMbar - surfaceMbar;
+  g_kpa   = gaugeMbar / 10.0f;              // 1 mbar = 0.1 kPa
+  g_depth = (gaugeMbar * 100.0f) / (FLUID_DENSITY * GRAVITY) + SENSOR_MOUNT_OFFSET_M;
+  g_sensorOk = true;
+  return true;
+}
+
+// Average several samples at the surface on startup to zero pressure (A2 tare).
+static void tareSurface() {
+  if (!g_sensorPresent) {
+    Serial.println("Surface tare skipped: Keller LD not initialized (fallback mode).");
+    return;
+  }
+  const int N = 20;
+  float sum = 0.0f; int good = 0;
+  for (int i = 0; i < N; ++i) {
+    sensor.read();
+    float mb = sensor.pressure();
+    if (mb > 300.0f && mb < 20000.0f) { sum += mb; good++; }
+    delay(50);
+  }
+  if (good > 0) surfaceMbar = sum / good;
+  Serial.print("Surface tare (mbar): "); Serial.println(surfaceMbar);
+  Serial.print("Mount offset (m):   "); Serial.println(SENSOR_MOUNT_OFFSET_M);
+}
+
+static void scanI2C() {
+  Serial.print("I2C scan on Wire - SDA=GPIO");
+  Serial.print(I2C_SDA_PIN);
+  Serial.print(" SCL=GPIO");
+  Serial.print(I2C_SCL_PIN);
+  Serial.println(":");
+
+  int found = 0;
+  for (uint8_t address = 1; address < 127; ++address) {
+    Wire.beginTransmission(address);
+    if (Wire.endTransmission() == 0) {
+      Serial.print("  found device at 0x");
+      if (address < 16) Serial.print("0");
+      Serial.println(address, HEX);
+      found++;
+    }
+  }
+  if (found == 0) Serial.println("  no I2C devices found");
+  Serial.print("I2C scan done, ");
+  Serial.print(found);
+  Serial.println(" device(s).");
+}
+
+// -----------------------------------------------------------------------------
+// Sensorless model update (dead reckoning) — the fallback estimator. Integrates
+// ballast from pump run-time, then integrates the vertical equation of motion.
 //   F_down = (m_dry + rho*V_ballast)*g  -  rho*g*V_hull      (weight - buoyancy)
 //   F_drag = 0.5 * rho * Cd * A * v*|v|                      (opposes motion)
 //   a      = (F_down - F_drag) / (m + Ca*rho*V_hull)         (added mass)
@@ -240,12 +349,15 @@ static void updateModel() {
 }
 
 // -----------------------------------------------------------------------------
-// Logging (A3) — bounded buffer. NOTE: depth/pressure here are ESTIMATED.
+// Logging (A3) — bounded buffer. Uses measured depth/pressure when the sensor is
+// healthy, else the dead-reckoned estimate.
 // -----------------------------------------------------------------------------
 static void logPacket() {
   if (packetCount >= MAX_PACKETS) return;
   unsigned long tsec = missionStart ? (millis() - missionStart) / 1000 : 0;
-  packets[packetCount++] = { tsec, est_depth, est_kpa };
+  float d = useSensor() ? g_depth : est_depth;
+  float p = useSensor() ? g_kpa   : est_kpa;
+  packets[packetCount++] = { tsec, d, p };
 }
 
 // -----------------------------------------------------------------------------
@@ -275,21 +387,24 @@ static void transmitNext() {
 }
 
 // -----------------------------------------------------------------------------
-// Hold helper: servo to neutral and count 30 s only while the ESTIMATE is in band;
+// Hold helper: servo to neutral and count 30 s only while depthNow() is in band;
 // reset the clock the instant it leaves. Logs a packet every 5 s while in band.
-// `protectSurface` adds ballast if the estimate rises above the ascent floor.
+// `protectSurface` adds ballast if the depth rises above the ascent floor.
 // Returns true on a completed in-band 30 s hold.
 // -----------------------------------------------------------------------------
 static bool serviceHold(float setpoint, bool protectSurface) {
   unsigned long now = millis();
+  float depth = depthNow();
 
-  if (protectSurface && est_depth <= ASCENT_FLOOR) {
+  if (protectSurface && depth <= ASCENT_FLOOR) {
     pumpIn(PWM_MAX);                       // too shallow: add ballast, sink back
+  } else if (useSensor()) {
+    controlDepth(setpoint);                // closed-loop hold on measured depth
   } else {
-    servoBallast(neutralBallastMl());      // best-effort neutral trim
+    servoBallast(neutralBallastMl());      // fallback: best-effort neutral trim
   }
 
-  if (fabsf(est_depth - setpoint) <= BAND) {
+  if (fabsf(depth - setpoint) <= BAND) {
     if (now - holdPacketTimer >= PACKET_INTERVAL) {
       logPacket();
       holdPacketTimer = now;
@@ -324,10 +439,24 @@ static void enterPhase(State s) {
   continuousTimer = millis() - PACKET_INTERVAL;   // log immediately on entry
   holdStart = millis();
   holdPacketTimer = millis() - PACKET_INTERVAL;
+  lastControl = millis();
+  depthPid.reset();                               // fresh hold: no inherited integral
 }
 
 static bool isActiveMission(State s) {
   return s == DIVE || s == HOLD_DEEP || s == RISE || s == HOLD_SHALLOW;
+}
+
+// Watch a sensor that was present at boot but starts returning bad reads mid-run.
+// A sensor that was NEVER present is not a fault — that's the fallback path.
+static void checkSensorHealth() {
+  if (!g_sensorPresent) return;
+  if (g_sensorOk) { sensorBadSince = 0; return; }
+  unsigned long now = millis();
+  if (sensorBadSince == 0) sensorBadSince = now;
+  else if (now - sensorBadSince >= SENSOR_FAIL_MS && isActiveMission(state)) {
+    enterFault("sensor read failure");
+  }
 }
 
 static void heartbeat() {
@@ -337,7 +466,7 @@ static void heartbeat() {
   if (now - ledTimer >= period) {
     ledTimer = now;
     ledOn = !ledOn;
-    digitalWrite(PIN_LED, ledOn ? HIGH : LOW);   // XIAO LED is active-LOW (cosmetic)
+    digitalWrite(PIN_LED, ledOn ? LED_ON : LED_OFF);
   }
 }
 
@@ -352,36 +481,61 @@ void setup() {
   pinMode(PIN_PUMP_IN2, OUTPUT);
   pinMode(PIN_PUMP_PWM, OUTPUT);
   pinMode(PIN_LED, OUTPUT);
+  digitalWrite(PIN_LED, LED_OFF);
   pumpStop();
 
-  // Sensorless start assumption: the float is hand-launched at the surface with
-  // the bags empty, so depth = 0 and ballast = 0. If your reservoir is pre-filled,
-  // set ballast_ml here to match, or empty it before launch.
+  // Sensorless start assumption (also the fallback baseline): float is hand-launched
+  // at the surface with bags empty, so depth = 0 and ballast = 0.
   ballast_ml  = 0.0f;
   est_depth   = 0.0f;
   est_vel     = 0.0f;
   lastModelMs = millis();
 
-  Serial.println("FLOAT powered on (SENSORLESS) — HC-12 listening for any signal to start...");
+  // I2C + Keller sensor bring-up. Never blocks — missing sensor => fallback mode.
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  delay(250);
+  scanI2C();
+
+  int attempts = 0;
+  do {
+    sensor.init();
+    if (sensor.isInitialized()) { g_sensorPresent = true; break; }
+    Serial.println("Keller LD not detected — check I2C wiring and Vin > 3.65 V");
+    delay(500);
+  } while (++attempts < 5);
+
+  if (g_sensorPresent) {
+    sensor.setFluidDensity(FLUID_DENSITY);
+    tareSurface();
+    Serial.println("FLOAT powered on (SENSOR mode) — closed-loop PID depth hold.");
+  } else {
+    Serial.println("FLOAT powered on (SENSORLESS fallback) — Keller LD absent, running");
+    Serial.println("open-loop ballast schedule + dead reckoning. Mission still proceeds.");
+  }
+
+  Serial.println("HC-12 listening for any signal to start...");
   Serial.print("Full-stroke time (ms): "); Serial.println(FULL_STROKE_MS);
   Serial.print("Neutral ballast (mL):  "); Serial.println(neutralBallastMl());
 }
 
 // =============================================================================
-// loop()  —  mission state machine (A1), driven by the dead-reckoning estimate
+// loop()  —  mission state machine (A1), driven by depthNow()
 // =============================================================================
 void loop() {
   heartbeat();
-  updateModel();                    // refresh ballast + estimated depth/velocity
+  updateModel();                    // always keep the fallback estimate valid
+  if (g_sensorPresent) readSensor();
+  checkSensorHealth();
 
-  // USB telemetry (1 Hz): estimated depth/velocity + tracked ballast.
+  // USB telemetry (1 Hz): active depth source + tracked ballast.
   static unsigned long dbgTimer = 0;
   if (isActiveMission(state) && millis() - dbgTimer >= 1000) {
     dbgTimer = millis();
-    Serial.print("est_depth "); Serial.print(est_depth, 2);
+    Serial.print(useSensor() ? "[SENSOR] depth " : "[EST] depth ");
+    Serial.print(depthNow(), 2);
     Serial.print(" m  est_vel "); Serial.print(est_vel, 3);
     Serial.print(" m/s  ballast "); Serial.print(ballast_ml, 1);
-    Serial.println(" mL  [ESTIMATED]");
+    Serial.println(" mL");
   }
 
   switch (state) {
@@ -390,8 +544,8 @@ void loop() {
     case WAIT: {
       if (millis() - continuousTimer >= 1000) {
         continuousTimer = millis();
-        Serial.print("WAITING for HC-12 signal | est_depth=");
-        Serial.print(est_depth, 2);
+        Serial.print(useSensor() ? "WAITING (sensor) | depth=" : "WAITING (fallback) | depth=");
+        Serial.print(depthNow(), 2);
         Serial.print(" m  ballast=");
         Serial.print(ballast_ml, 1);
         Serial.print(" mL  t=");
@@ -413,22 +567,21 @@ void loop() {
       break;
     }
 
-    // A1: descend — fill the bags (heaviest) and ride the estimate down to 2.5 m.
+    // A1: descend — heaviest, ride depth down to 2.5 m.
     case DIVE: {
       serviceContinuousLog();
-      servoBallast(DIVE_BALLAST_ML);
-      if (est_depth >= DEEP_DEPTH) {
-        Serial.println("Estimated 2.5 m — holding.");
-        holdStart = millis();
-        holdPacketTimer = millis() - PACKET_INTERVAL;
+      if (useSensor()) controlDepth(DEEP_DEPTH);
+      else             servoBallast(DIVE_BALLAST_ML);
+      if (depthNow() >= DEEP_DEPTH) {
+        Serial.println("Reached 2.5 m — holding.");
         enterPhase(HOLD_DEEP);
       } else if (millis() - phaseStart > DIVE_TIMEOUT_MS) {
-        enterFault("dive timeout — estimate never reached 2.5 m");
+        enterFault("dive timeout — never reached 2.5 m");
       }
       break;
     }
 
-    // A1: hold ~2.5 m for 30 s (in-band by estimate; reset clock if it drifts out).
+    // A1: hold ~2.5 m for 30 s (in-band; reset clock if it drifts out).
     case HOLD_DEEP: {
       if (serviceHold(DEEP_DEPTH, false)) {
         Serial.println("Deep hold complete — rising.");
@@ -439,18 +592,17 @@ void loop() {
       break;
     }
 
-    // A1: ascend — empty the bags (lightest) and ride the estimate up to 0.40 m.
+    // A1: ascend — lightest, ride depth up to 0.40 m.
     case RISE: {
       serviceContinuousLog();
-      if (est_depth <= ASCENT_FLOOR) pumpIn(PWM_MAX);  // surface guard
-      else servoBallast(RISE_BALLAST_ML);
-      if (est_depth <= SHALLOW_DEPTH) {
-        Serial.println("Estimated 0.40 m — holding.");
-        holdStart = millis();
-        holdPacketTimer = millis() - PACKET_INTERVAL;
+      if (depthNow() <= ASCENT_FLOOR)  pumpIn(PWM_MAX);     // surface guard
+      else if (useSensor())            controlDepth(SHALLOW_DEPTH);
+      else                             servoBallast(RISE_BALLAST_ML);
+      if (depthNow() <= SHALLOW_DEPTH) {
+        Serial.println("Reached 0.40 m — holding.");
         enterPhase(HOLD_SHALLOW);
       } else if (millis() - phaseStart > RISE_TIMEOUT_MS) {
-        enterFault("rise timeout — estimate never reached 0.40 m");
+        enterFault("rise timeout — never reached 0.40 m");
       }
       break;
     }
@@ -476,7 +628,7 @@ void loop() {
       break;
     }
 
-    // A5: transmit the buffered (estimated) packets discretely, one at a time.
+    // A5: transmit the buffered packets discretely, one at a time.
     case DONE: {
       pumpStop();
       transmitNext();

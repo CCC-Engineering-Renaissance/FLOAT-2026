@@ -1,0 +1,4 @@
+# arduino-cli build output (make compile/upload --build-path)
+build/
+# PlatformIO (legacy)
+.pio/
