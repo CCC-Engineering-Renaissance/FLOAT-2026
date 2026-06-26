@@ -74,6 +74,12 @@ static const float SENSOR_MOUNT_OFFSET_M = 0.00f;     // A2: sensor-to-reference
 // Sensor health: if the sensor was present but reads have been bad this long, fault.
 static const unsigned long SENSOR_FAIL_MS = 3000;
 
+// Control source. false = fly the mission on the dead-reckoning METHOD even when a
+// pressure sensor is physically present: the sensor still inits and is read (for
+// reference/telemetry), but its data NEVER drives control, phase changes, or the
+// logged packets. true = closed-loop PID on measured depth (method as fallback).
+static const bool CONTROL_USES_SENSOR = false;
+
 // -----------------------------------------------------------------------------
 // Physical / hardware measurements (as-built float). The sensorless model and the
 // ballast servo run entirely off these — keep them accurate to the real build.
@@ -180,7 +186,10 @@ static unsigned long ledTimer       = 0;
 //   useSensor() -> true once the sensor inited AND is returning plausible reads.
 //   depthNow()  -> measured depth when healthy, else dead-reckoned estimate.
 // -----------------------------------------------------------------------------
-static bool  useSensor() { return g_sensorPresent && g_sensorOk; }
+// CONTROL_USES_SENSOR == false forces the METHOD: useSensor() is always false, so
+// depthNow() and every control/phase/log decision uses the dead-reckoned estimate
+// regardless of whether the Keller LD is present and healthy.
+static bool  useSensor() { return CONTROL_USES_SENSOR && g_sensorPresent && g_sensorOk; }
 static float depthNow()  { return useSensor() ? g_depth : est_depth; }
 
 // -----------------------------------------------------------------------------
@@ -450,6 +459,7 @@ static bool isActiveMission(State s) {
 // Watch a sensor that was present at boot but starts returning bad reads mid-run.
 // A sensor that was NEVER present is not a fault — that's the fallback path.
 static void checkSensorHealth() {
+  if (!CONTROL_USES_SENSOR) return;   // sensor ignored for control -> its health can't fault the run
   if (!g_sensorPresent) return;
   if (g_sensorOk) { sensorBadSince = 0; return; }
   unsigned long now = millis();
@@ -507,7 +517,11 @@ void setup() {
   if (g_sensorPresent) {
     sensor.setFluidDensity(FLUID_DENSITY);
     tareSurface();
-    Serial.println("FLOAT powered on (SENSOR mode) — closed-loop PID depth hold.");
+    if (CONTROL_USES_SENSOR)
+      Serial.println("FLOAT powered on (SENSOR mode) — closed-loop PID depth hold.");
+    else
+      Serial.println("FLOAT powered on (METHOD mode) — Keller LD present but IGNORED for "
+                     "control; flying open-loop ballast schedule + dead reckoning.");
   } else {
     Serial.println("FLOAT powered on (SENSORLESS fallback) — Keller LD absent, running");
     Serial.println("open-loop ballast schedule + dead reckoning. Mission still proceeds.");
