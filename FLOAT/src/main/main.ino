@@ -1,6 +1,6 @@
 // =============================================================================
 // FLOAT-2026 firmware  —  MATE "MATE Floats! Under the Ice" vertical profiler
-// Single-program firmware for the Raspberry Pi Pico (RP2040), Arduino framework.
+// Single-program firmware for the Seeed Studio XIAO ESP32-S3, Arduino framework.
 //
 // This is the ONE program with a single setup()/loop() (REQUIREMENTS A7). It
 // folds in what used to live in the uncalled setupSensor()/loopSensor(), drops
@@ -22,24 +22,32 @@
 #include "PID.h"
 
 // -----------------------------------------------------------------------------
-// Pin map  (A7: fixes LED 2 vs pumpPin2 2, and pumpPin1 1 vs HC-12 RX 1 / TX 0)
-// Hardware: Raspberry Pi Pico 2 (RP2350), L298N dual H-bridge driver module,
+// Pin map for Seeed Studio XIAO ESP32-S3.
+// Hardware: Seeed Studio XIAO ESP32-S3, L298N dual H-bridge driver module,
 //           Blue Robotics BarXT (Keller 4LD, I2C 0x40, needs Vin > 3.65 V),
 //           HC-12 radio, 12 V peristaltic pump on driver channel A.
-//   HC-12 radio : Serial1 = UART0 -> GP0 (Pico TX -> HC-12 RX), GP1 (Pico RX <- HC-12 TX)
-//   BarXT (Keller): Wire = I2C0   -> GP4 (SDA), GP5 (SCL); power Vin from 5 V rail
-//                   (NOT 3.3 V), I2C pull-ups to 3.3 V.
-//   L298N ch A  : IN1=GP10, IN2=GP11, ENA=GP12 (PWM speed/enable). No STBY-style
-//                 chip-sleep pin exists on the L298N — remove the board's ENA
-//                 jumper (if present) before wiring GP12 there, or the GPIO
+//   HC-12 radio : Serial1 -> D6/GPIO43 (XIAO TX -> HC-12 RX),
+//                           D7/GPIO44 (XIAO RX <- HC-12 TX)
+//   BarXT       : Wire    -> D4/GPIO5 (SDA), D5/GPIO6 (SCL);
+//                           power Vin from 5 V rail (NOT 3.3 V),
+//                           I2C pull-ups to 3.3 V.
+//   L298N ch A  : IN1=D1/GPIO2, IN2=D2/GPIO3, ENA=D0/GPIO1 (PWM speed/enable).
+//                 No STBY-style chip-sleep pin exists on the L298N — remove
+//                 the board's ENA
+//                 jumper (if present) before wiring GPIO1 there, or the GPIO
 //                 will be fighting a hardwired 5 V tie. IN3/IN4/ENB (channel B)
 //                 are unused.
-//                 VM = 12 V battery, logic VCC = Pico 3V3, GND common.
-//   LED         : on-board LED instead of GP2.
+//                 VM = 12 V battery, logic VCC = XIAO 3V3, GND common.
+//   LED         : XIAO user LED = GPIO21 (active-LOW).
 // -----------------------------------------------------------------------------
-#define PIN_PUMP_IN1  10  // L298N IN1 (direction)
-#define PIN_PUMP_IN2  11  // L298N IN2 (direction)
-#define PIN_PUMP_PWM  12  // L298N ENA (PWM speed/enable)
+#define PIN_PUMP_IN1  2   // D1/GPIO2: L298N IN1 (direction)
+#define PIN_PUMP_IN2  3   // D2/GPIO3: L298N IN2 (direction)
+#define PIN_PUMP_PWM  1   // D0/GPIO1: L298N ENA (PWM speed/enable)
+#define PIN_LED       21  // XIAO S3 user LED (active-LOW)
+#define HC12_RX_PIN   44  // D7/GPIO44: XIAO RX <- HC-12 TX
+#define HC12_TX_PIN   43  // D6/GPIO43: XIAO TX -> HC-12 RX
+#define I2C_SDA_PIN   5   // D4/GPIO5: BarXT SDA
+#define I2C_SCL_PIN   6   // D5/GPIO6: BarXT SCL
 
 #define HC12 Serial1
 static const unsigned long HC12_BAUD = 9600;
@@ -227,7 +235,7 @@ static String fmtTime(unsigned long sec) {
 }
 static String formatPacket(const Packet& p) {
   // String(float, 2) is universally available and avoids %f printf-float linker
-  // issues across Pico cores.
+  // issues in embedded Arduino builds.
   return String(COMPANY) + " " + fmtTime(p.t) + " " +
          String(p.kpa, 2) + " kPa " + String(p.depth, 2) + " m";
 }
@@ -342,7 +350,7 @@ static void heartbeat() {
 // =============================================================================
 void setup() {
   Serial.begin(USB_BAUD);
-  HC12.begin(HC12_BAUD);            // Serial1 default pins GP0(TX)/GP1(RX)
+  HC12.begin(HC12_BAUD, SERIAL_8N1, HC12_RX_PIN, HC12_TX_PIN);
 
   pinMode(PIN_PUMP_IN1, OUTPUT);
   pinMode(PIN_PUMP_IN2, OUTPUT);
@@ -350,7 +358,28 @@ void setup() {
   pinMode(PIN_LED, OUTPUT);
   pumpStop();
 
-  Wire.begin();                     // I2C0 GP4(SDA)/GP5(SCL)
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+
+  // TEMP DIAGNOSTIC: scan I2C so we can see whether the BarXT (Keller) shows up
+  // at 0x40 at all. If nothing prints, it's wiring/power (Vin > 3.65 V, pull-ups);
+  // if 0x40 prints but reads still fail, it's an init/library issue. Remove once
+  // the sensor is confirmed.
+  delay(250);                       // let the bus/sensor settle after power-up
+  Serial.print("I2C scan on Wire — SDA=GPIO");
+  Serial.print(I2C_SDA_PIN); Serial.print(" SCL=GPIO"); Serial.print(I2C_SCL_PIN); Serial.println(":");
+  {
+    int found = 0;
+    for (uint8_t a = 1; a < 127; a++) {
+      Wire.beginTransmission(a);
+      if (Wire.endTransmission() == 0) {
+        Serial.print("  found device at 0x");
+        Serial.println(a, HEX);
+        found++;
+      }
+    }
+    if (found == 0) Serial.println("  (no I2C devices found — check wiring/power)");
+    Serial.print("I2C scan done, "); Serial.print(found); Serial.println(" device(s).");
+  }
 
   // A6: bounded init retries — don't spin forever. If the sensor never comes
   // up, fall through; the loop's fault path keeps the pump safe.
@@ -364,6 +393,13 @@ void setup() {
     delay(1000);
   } while (++attempts < 10);
   sensor.setFluidDensity(FLUID_DENSITY);
+
+  // TEMP DIAGNOSTIC: report the sensor's full-scale range and resolution so we
+  // know how much pressure is actually needed to see a change. range() is in bar;
+  // resolution per ADC count = range/32768. Remove once the sensor is confirmed.
+  Serial.print("Keller range (bar): ");  Serial.println(sensor.range(), 4);
+  Serial.print("Resolution (mbar/count): ");
+  Serial.println(sensor.range() * 1000.0f / 32768.0f, 4);
 
   tareSurface();                    // A2: zero pressure to atmospheric at surface
 
@@ -409,6 +445,13 @@ void loop() {
         Serial.print(g_kpa, 2);
         Serial.print("  sensor=");
         Serial.print(g_sensorOk ? "OK" : "FAIL");
+        // TEMP DIAGNOSTIC: temperature responds to body heat in seconds with no
+        // liquid coupling. If tempC moves when you cup the sensor but pressure
+        // doesn't, read() is live and the gel just isn't seeing your air/finger
+        // (sensor fine, test in water). If tempC is ALSO frozen, reads are stale
+        // -> recheck the changed I2C wiring. Remove once confirmed.
+        Serial.print("  tempC=");
+        Serial.print(sensor.temperature(), 2);
         Serial.print("  t=");
         Serial.print(millis() / 1000);
         Serial.println("s");

@@ -1,5 +1,5 @@
 // =============================================================================
-// FLOAT-2026  —  10-SECOND SURFACE TEST  (Raspberry Pi Pico 2 / RP2350)
+// FLOAT-2026  —  10-SECOND SURFACE TEST  (Seeed Studio XIAO ESP32-S3)
 // -----------------------------------------------------------------------------
 // A bench/surface version of the real mission firmware (src/main/main.ino).
 // The real firmware dives to 2.5 m and won't stop until depth is reached (or a
@@ -20,16 +20,17 @@
 // then stops the pump. If you don't want the pump running dry, unplug pump motor
 // power (VM) and just watch the L298N IN1/IN2/ENA signals + sensor + comms.
 //
-// WIRING (matches src/main/main.ino):
-//   HC-12 radio  : Serial1 = UART0 -> GP0 (Pico TX -> HC-12 RX), GP1 (Pico RX <- HC-12 TX)
-//   BarXT(Keller): Wire = I2C0 -> GP4 (SDA), GP5 (SCL); power Vin from 5 V rail
-//   L298N ch A   : IN1=GP10, IN2=GP11, ENA=GP12 (PWM). Remove the board ENA jumper
+// WIRING (matches src/main/main.ino for XIAO ESP32-S3):
+//   HC-12 radio  : Serial1 -> D6/GPIO43 (XIAO TX -> HC-12 RX),
+//                  D7/GPIO44 (XIAO RX <- HC-12 TX)
+//   BarXT(Keller): Wire -> D4/GPIO5 (SDA), D5/GPIO6 (SCL); power Vin from 5 V rail
+//   L298N ch A   : IN1=D1/GPIO2, IN2=D2/GPIO3, ENA=D0/GPIO1 (PWM). Remove the board ENA jumper
 //                  if present. IN3/IN4/ENB unused. VM = 12 V, logic VCC = 3V3, GND common.
-//   LED          : on-board LED.
+//   LED          : XIAO user LED (GPIO21, active-LOW).
 //
-// BUILD (Pico 2 / RP2350 — use rpipico2, NOT rpipico):
-//   arduino-cli compile --fqbn rp2040:rp2040:rpipico2 FLOAT/test/10_sec
-//   arduino-cli upload -p <port> --fqbn rp2040:rp2040:rpipico2 FLOAT/test/10_sec
+// BUILD (XIAO ESP32-S3):
+//   arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32S3 FLOAT/test/10_sec
+//   arduino-cli upload -p <port> --fqbn esp32:esp32:XIAO_ESP32S3 FLOAT/test/10_sec
 //   (needs the BlueRobotics KellerLD library installed, as in platformio.ini)
 // =============================================================================
 #include <Arduino.h>
@@ -40,9 +41,24 @@
 // -----------------------------------------------------------------------------
 // Pin map (same as src/main/main.ino)
 // -----------------------------------------------------------------------------
-#define PIN_PUMP_IN1  10  // L298N IN1 (direction)
-#define PIN_PUMP_IN2  11  // L298N IN2 (direction)
-#define PIN_PUMP_PWM  12  // L298N ENA (PWM speed/enable)
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+  #define PIN_PUMP_IN1  2   // XIAO D1/GPIO2  -> L298N IN1 (direction)
+  #define PIN_PUMP_IN2  3   // XIAO D2/GPIO3  -> L298N IN2 (direction)
+  #define PIN_PUMP_PWM  1   // XIAO D0/GPIO1  -> L298N ENA (PWM speed/enable)
+  #define PIN_LED       21  // XIAO user LED, active-LOW
+  #define LED_ON        LOW
+  #define LED_OFF       HIGH
+  #define HC12_RX_PIN   44  // XIAO D7/GPIO44 <- HC-12 TX
+  #define HC12_TX_PIN   43  // XIAO D6/GPIO43 -> HC-12 RX
+  #define I2C_SDA_PIN   5   // XIAO D4/GPIO5
+  #define I2C_SCL_PIN   6   // XIAO D5/GPIO6
+#else
+  #define PIN_PUMP_IN1  10  // Pico GP10 -> L298N IN1 (direction)
+  #define PIN_PUMP_IN2  11  // Pico GP11 -> L298N IN2 (direction)
+  #define PIN_PUMP_PWM  12  // Pico GP12 -> L298N ENA (PWM speed/enable)
+  #define LED_ON        HIGH
+  #define LED_OFF       LOW
+#endif
 
 #define HC12 Serial1
 static const unsigned long HC12_BAUD = 9600;
@@ -100,6 +116,7 @@ static float  surfaceMbar = 1013.25f;
 static float  g_depth = 0.0f;
 static float  g_kpa   = 0.0f;
 static bool   g_sensorOk = false;
+static bool   g_sensorPresent = false;
 
 // timers
 static unsigned long missionStart   = 0;
@@ -138,6 +155,10 @@ static void pumpStop() {
 // tare makes depth == 0 at the surface, then the mount offset is applied.
 // -----------------------------------------------------------------------------
 static bool readSensor() {
+  if (!g_sensorPresent) {
+    g_sensorOk = false;
+    return false;
+  }
   sensor.read();
   float absMbar = sensor.pressure();        // mbar absolute (library default)
   if (!(absMbar > 300.0f && absMbar < 20000.0f) || isnan(absMbar)) {
@@ -153,6 +174,10 @@ static bool readSensor() {
 
 // Average several samples at the surface on startup to zero pressure.
 static void tareSurface() {
+  if (!g_sensorPresent) {
+    Serial.println("Surface tare skipped: BarXT (Keller) is not initialized.");
+    return;
+  }
   const int N = 20;
   float sum = 0.0f; int good = 0;
   for (int i = 0; i < N; ++i) {
@@ -173,6 +198,29 @@ static void logPacket() {
   if (packetCount >= MAX_PACKETS) return;
   unsigned long tsec = missionStart ? (millis() - missionStart) / 1000 : 0;
   packets[packetCount++] = { tsec, g_depth, g_kpa };
+}
+
+static void scanI2C() {
+  Serial.print("I2C scan on Wire - SDA=GPIO");
+  Serial.print(SDA);
+  Serial.print(" SCL=GPIO");
+  Serial.print(SCL);
+  Serial.println(":");
+
+  int found = 0;
+  for (uint8_t address = 1; address < 127; ++address) {
+    Wire.beginTransmission(address);
+    if (Wire.endTransmission() == 0) {
+      Serial.print("  found device at 0x");
+      if (address < 16) Serial.print("0");
+      Serial.println(address, HEX);
+      found++;
+    }
+  }
+  if (found == 0) Serial.println("  no I2C devices found");
+  Serial.print("I2C scan done, ");
+  Serial.print(found);
+  Serial.println(" device(s).");
 }
 
 // -----------------------------------------------------------------------------
@@ -237,7 +285,7 @@ static void heartbeat() {
   if (now - ledTimer >= period) {
     ledTimer = now;
     ledOn = !ledOn;
-    digitalWrite(PIN_LED, ledOn ? HIGH : LOW);
+    digitalWrite(PIN_LED, ledOn ? LED_ON : LED_OFF);
   }
 }
 
@@ -246,31 +294,52 @@ static void heartbeat() {
 // =============================================================================
 void setup() {
   Serial.begin(USB_BAUD);
-  HC12.begin(HC12_BAUD);            // Serial1 default pins GP0(TX)/GP1(RX)
+#if defined(HC12_RX_PIN)
+  HC12.begin(HC12_BAUD, SERIAL_8N1, HC12_RX_PIN, HC12_TX_PIN);  // ESP32-S3: explicit exposed pads
+#else
+  HC12.begin(HC12_BAUD);            // RP2040: Serial1 default pins GP0(TX)/GP1(RX)
+#endif
 
   pinMode(PIN_PUMP_IN1, OUTPUT);
   pinMode(PIN_PUMP_IN2, OUTPUT);
   pinMode(PIN_PUMP_PWM, OUTPUT);
   pinMode(PIN_LED, OUTPUT);
-  analogWriteRange(255);            // RP2350 core defaults PWM to 0-1023, not 0-255
+  digitalWrite(PIN_LED, LED_OFF);
+#if defined(ARDUINO_ARCH_RP2040)
+  analogWriteRange(255);            // RP2040/RP2350 core defaults PWM to 0-1023, not 0-255
+#endif
   pumpStop();
 
-  Wire.begin();                     // I2C0 GP4(SDA)/GP5(SCL)
+#if defined(I2C_SDA_PIN)
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);      // XIAO ESP32-S3: D4/GPIO5 SDA, D5/GPIO6 SCL
+#else
+  Wire.begin();                              // Pico: GP4/GP5
+#endif
+  delay(250);
+  scanI2C();
 
   // Bounded init retries — don't spin forever.
   int attempts = 0;
   do {
     sensor.init();
-    if (sensor.isInitialized()) break;
+    if (sensor.isInitialized()) {
+      g_sensorPresent = true;
+      break;
+    }
     Serial.println("BarXT (Keller) not detected — check I2C wiring and Vin > 3.65 V");
     delay(1000);
   } while (++attempts < 10);
-  sensor.setFluidDensity(FLUID_DENSITY);
+  if (g_sensorPresent) sensor.setFluidDensity(FLUID_DENSITY);
 
   tareSurface();                    // zero pressure to atmospheric at surface
 
-  Serial.println("10-SECOND SURFACE TEST ready — send any signal (HC-12 byte, or");
-  Serial.println("type a char + Enter here in bench mode) to start the 10 s window.");
+  if (g_sensorPresent) {
+    Serial.println("10-SECOND SURFACE TEST ready — send any signal (HC-12 byte, or");
+    Serial.println("type a char + Enter here in bench mode) to start the 10 s window.");
+  } else {
+    Serial.println("10-SECOND SURFACE TEST blocked: BarXT (Keller) was not detected.");
+    Serial.println("Fix I2C wiring/power, then reset the board. Pump will stay stopped.");
+  }
 }
 
 // =============================================================================
@@ -293,6 +362,11 @@ void loop() {
 #endif
       if (in) {
         while (in->available()) in->read();   // drain the trigger bytes
+        if (!g_sensorPresent) {
+          pumpStop();
+          Serial.println("Start ignored: BarXT (Keller) is not detected.");
+          break;
+        }
         missionStart = millis();
         Serial.println("Signal received — collecting for 10 s (pump under PID).");
         enterCollect();
