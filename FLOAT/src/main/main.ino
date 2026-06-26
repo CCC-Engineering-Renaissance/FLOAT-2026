@@ -9,8 +9,13 @@
 // completion. The sensor is never a hard blocker.
 //
 //   sensor present & healthy  ->  PID holds MEASURED depth (g_depth), tight band.
-//   sensor absent / failed    ->  open-loop ballast schedule + dead-reckoned
-//                                 est_depth + per-phase timeouts (best effort).
+//   sensor absent / failed    ->  OPEN-LOOP TIMED schema: pump IN a calibrated
+//                                 time to descend, timed 30 s hold, pump OUT a
+//                                 calibrated time to ascend, timed hold, x2.
+//                                 Sequenced on pump run-time/ballast volume (the
+//                                 only reliable observable without a depth sensor),
+//                                 NOT on the dead-reckoned depth. CALIBRATE the run
+//                                 times (DIVE_RUN_MS / RISE_RUN_MS) in the pool.
 //
 // HONEST LIMITATIONS (fallback mode only)
 //   * The dead-reckoned depth DRIFTS — "hold" is best-effort, not guaranteed
@@ -26,10 +31,10 @@
 
 // -----------------------------------------------------------------------------
 // Pin map for ESP32-S3 WROOM.
-//   HC-12 radio : Serial1 -> GPIO43 (ESP32 TX -> HC-12 RX),
-//                           GPIO44 (ESP32 RX <- HC-12 TX).
-//                 (Serial console runs over native USB-CDC, so 43/44 are free —
-//                  build with -D ARDUINO_USB_CDC_ON_BOOT=1, see platformio.ini.)
+//   HC-12 radio : Serial1 -> GPIO17 (ESP32 TX -> HC-12 RX),
+//                           GPIO18 (ESP32 RX <- HC-12 TX).
+//                 (GPIO43/44 are the UART0 console pins, taken by the onboard
+//                  CH343 USB-serial bridge — the HC-12 must NOT use them.)
 //   Keller LD   : Wire -> GPIO1 (SDA), GPIO2 (SCL); sensor Vin > 3.65 V.
 //   L298N ch A  : IN1=GPIO5, IN2=GPIO6, ENA=GPIO4 (PWM speed/enable).
 //                 VM = 12 V battery, logic VCC = 3V3, GND common.
@@ -41,8 +46,8 @@
 #define PIN_LED       21   // user LED (active-LOW)
 #define LED_ON        LOW
 #define LED_OFF       HIGH
-#define HC12_RX_PIN   44   // ESP32 RX <- HC-12 TX
-#define HC12_TX_PIN   43   // ESP32 TX -> HC-12 RX
+#define HC12_RX_PIN   18   // ESP32 RX <- HC-12 TX
+#define HC12_TX_PIN   17   // ESP32 TX -> HC-12 RX
 #define I2C_SDA_PIN   1    // Keller SDA
 #define I2C_SCL_PIN   2    // Keller SCL
 
@@ -115,6 +120,16 @@ static const float BALLAST_TOL_ML  = 2.0f;         // servo deadband
 static const unsigned long DIVE_TIMEOUT_MS = FULL_STROKE_MS + 90000;  // ~166 s
 static const unsigned long RISE_TIMEOUT_MS = FULL_STROKE_MS + 90000;  // ~166 s
 static const unsigned long HOLD_TIMEOUT_MS = 120000;                  // give up holding -> FAULT
+
+// --- Sensorless (fallback) TIMED schema ---------------------------------------
+// Without a depth sensor the ONLY reliable actuator feedback is pump run-time
+// (= water volume moved, positive-displacement). So in fallback mode each travel
+// phase runs the pump a fixed, calibrated time instead of chasing a depth number.
+// CALIBRATE IN THE POOL: time how long the pump must run IN to settle at ~2.5 m
+// and OUT to settle at ~0.4 m, then set these. Keep them well under the *_TIMEOUT_MS
+// watchdogs above so the schema completes before the safety fault trips.
+static const unsigned long DIVE_RUN_MS = 30000;   // pump IN this long -> descend to ~2.5 m
+static const unsigned long RISE_RUN_MS = 30000;   // pump OUT this long -> ascend to ~0.4 m
 
 static const unsigned long HOLD_MS         = 30000;   // A1: 30 s in-band hold
 static const unsigned long PACKET_INTERVAL = 5000;    // A3: log at least every 5 s
@@ -191,6 +206,8 @@ static unsigned long ledTimer       = 0;
 // regardless of whether the Keller LD is present and healthy.
 static bool  useSensor() { return CONTROL_USES_SENSOR && g_sensorPresent && g_sensorOk; }
 static float depthNow()  { return useSensor() ? g_depth : est_depth; }
+
+static bool isActiveMission(State s);   // fwd decl: updateModel() gates on it
 
 // -----------------------------------------------------------------------------
 // Pump (buoyancy engine). Each call also sets pump_dir so the ballast integrator
@@ -338,19 +355,25 @@ static void updateModel() {
   if (ballast_ml < 0.0f)        ballast_ml = 0.0f;
   if (ballast_ml > BALLAST_ML)  ballast_ml = BALLAST_ML;
 
-  // 2) Vertical dynamics.
-  float V_ball = ballast_ml * 1e-6f;
-  float mass   = FLOAT_MASS_KG + FLUID_DENSITY * V_ball;
-  float F_down = mass * GRAVITY - FLUID_DENSITY * GRAVITY * V_HULL_M3;
-  float F_drag = 0.5f * FLUID_DENSITY * DRAG_CD * A_CROSS * est_vel * fabsf(est_vel);
-  float m_eff  = mass + ADDED_MASS_CA * FLUID_DENSITY * V_HULL_M3;
-  float a      = (F_down - F_drag) / m_eff;
+  // 2) Vertical dynamics — ONLY while actually running a mission phase. Integrating
+  //    while WAITING at the surface made the estimate walk to metres before launch
+  //    and collapse the DIVE trigger; freeze it until the mission starts.
+  if (isActiveMission(state)) {
+    float V_ball = ballast_ml * 1e-6f;
+    float mass   = FLOAT_MASS_KG + FLUID_DENSITY * V_ball;
+    float F_down = mass * GRAVITY - FLUID_DENSITY * GRAVITY * V_HULL_M3;
+    float F_drag = 0.5f * FLUID_DENSITY * DRAG_CD * A_CROSS * est_vel * fabsf(est_vel);
+    float m_eff  = mass + ADDED_MASS_CA * FLUID_DENSITY * V_HULL_M3;
+    float a      = (F_down - F_drag) / m_eff;
 
-  est_vel   += a * dt;
-  est_depth += est_vel * dt;
-  if (est_depth < 0.0f) {                     // hit the surface
-    est_depth = 0.0f;
-    if (est_vel < 0.0f) est_vel = 0.0f;
+    est_vel   += a * dt;
+    est_depth += est_vel * dt;
+    if (est_depth < 0.0f) {                   // hit the surface
+      est_depth = 0.0f;
+      if (est_vel < 0.0f) est_vel = 0.0f;
+    }
+  } else {
+    est_vel = 0.0f;                           // not under way (WAIT / DONE / FAULT)
   }
 
   // Estimated gauge pressure from estimated depth (P = rho*g*h), kPa.
@@ -431,6 +454,23 @@ static void serviceContinuousLog() {
     logPacket();
     continuousTimer = now;
   }
+}
+
+// -----------------------------------------------------------------------------
+// Sensorless (fallback) hold: there is no depth to servo on, so just FREEZE the
+// ballast where the travel phase left it (full = stay deep, empty = stay shallow)
+// and count a fixed 30 s, logging a packet every 5 s (A3: 7 packets per hold).
+// Deterministic — always completes in HOLD_MS, so it never falls through to the
+// hold watchdog/FAULT the way the depth-band hold does without a sensor.
+// -----------------------------------------------------------------------------
+static bool serviceTimedHold() {
+  pumpStop();                                  // hold current ballast, no depth feedback
+  unsigned long now = millis();
+  if (now - holdPacketTimer >= PACKET_INTERVAL) {
+    logPacket();
+    holdPacketTimer = now;
+  }
+  return (now - holdStart >= HOLD_MS);
 }
 
 // -----------------------------------------------------------------------------
@@ -575,29 +615,40 @@ void loop() {
       if (in) {
         while (in->available()) in->read();
         missionStart = millis();
+        est_depth = 0.0f;                 // launch datum: surface = 0 at mission start
+        est_vel   = 0.0f;
         Serial.println("Signal received — diving.");
         enterPhase(DIVE);
       }
       break;
     }
 
-    // A1: descend — heaviest, ride depth down to 2.5 m.
+    // A1: descend. SENSOR -> PID to 2.5 m. FALLBACK -> pump IN for a calibrated
+    //     run time (fills the bag -> heavy -> sinks).
     case DIVE: {
       serviceContinuousLog();
-      if (useSensor()) controlDepth(DEEP_DEPTH);
-      else             servoBallast(DIVE_BALLAST_ML);
-      if (depthNow() >= DEEP_DEPTH) {
-        Serial.println("Reached 2.5 m — holding.");
+      bool reached;
+      if (useSensor()) {
+        controlDepth(DEEP_DEPTH);
+        reached = (depthNow() >= DEEP_DEPTH);
+      } else {
+        servoBallast(DIVE_BALLAST_ML);                 // pump IN toward a full bag
+        reached = (millis() - phaseStart >= DIVE_RUN_MS);
+      }
+      if (reached) {
+        Serial.println(useSensor() ? "Reached 2.5 m — holding."
+                                   : "Dive run complete — holding deep.");
         enterPhase(HOLD_DEEP);
       } else if (millis() - phaseStart > DIVE_TIMEOUT_MS) {
-        enterFault("dive timeout — never reached 2.5 m");
+        enterFault("dive timeout");
       }
       break;
     }
 
-    // A1: hold ~2.5 m for 30 s (in-band; reset clock if it drifts out).
+    // A1: hold ~2.5 m for 30 s. SENSOR -> in-band band hold. FALLBACK -> timed hold.
     case HOLD_DEEP: {
-      if (serviceHold(DEEP_DEPTH, false)) {
+      bool done = useSensor() ? serviceHold(DEEP_DEPTH, false) : serviceTimedHold();
+      if (done) {
         Serial.println("Deep hold complete — rising.");
         enterPhase(RISE);
       } else if (millis() - phaseStart > HOLD_TIMEOUT_MS) {
@@ -606,24 +657,33 @@ void loop() {
       break;
     }
 
-    // A1: ascend — lightest, ride depth up to 0.40 m.
+    // A1: ascend. SENSOR -> PID to 0.40 m. FALLBACK -> pump OUT for a calibrated
+    //     run time (empties the bag -> lighter -> rises).
     case RISE: {
       serviceContinuousLog();
-      if (depthNow() <= ASCENT_FLOOR)  pumpIn(PWM_MAX);     // surface guard
-      else if (useSensor())            controlDepth(SHALLOW_DEPTH);
-      else                             servoBallast(RISE_BALLAST_ML);
-      if (depthNow() <= SHALLOW_DEPTH) {
-        Serial.println("Reached 0.40 m — holding.");
+      bool reached;
+      if (useSensor()) {
+        if (depthNow() <= ASCENT_FLOOR) pumpIn(PWM_MAX);    // surface guard
+        else                            controlDepth(SHALLOW_DEPTH);
+        reached = (depthNow() <= SHALLOW_DEPTH);
+      } else {
+        servoBallast(RISE_BALLAST_ML);                 // pump OUT toward an empty bag
+        reached = (millis() - phaseStart >= RISE_RUN_MS);
+      }
+      if (reached) {
+        Serial.println(useSensor() ? "Reached 0.40 m — holding."
+                                   : "Rise run complete — holding shallow.");
         enterPhase(HOLD_SHALLOW);
       } else if (millis() - phaseStart > RISE_TIMEOUT_MS) {
-        enterFault("rise timeout — never reached 0.40 m");
+        enterFault("rise timeout");
       }
       break;
     }
 
-    // A1: hold ~0.40 m for 30 s with the surface guard, then next profile or finish.
+    // A1: hold ~0.40 m for 30 s, then next profile or finish.
     case HOLD_SHALLOW: {
-      if (serviceHold(SHALLOW_DEPTH, true)) {
+      bool done = useSensor() ? serviceHold(SHALLOW_DEPTH, true) : serviceTimedHold();
+      if (done) {
         cycle++;
         Serial.print("Profile "); Serial.print(cycle); Serial.println(" complete.");
         if (cycle < PROFILES) {
